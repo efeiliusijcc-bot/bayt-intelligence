@@ -1,0 +1,42 @@
+import { createLightTheme, type BrandVariants, type Theme } from "@fluentui/react-components";
+
+const governmentBlue: BrandVariants = {
+  10: "#06111c",
+  20: "#0a2135",
+  30: "#0c3452",
+  40: "#0d456c",
+  50: "#0e5687",
+  60: "#17699f",
+  70: "#2b7db4",
+  80: "#4390c5",
+  90: "#5ca3d4",
+  100: "#78b5df",
+  110: "#96c7e8",
+  120: "#b3d7ef",
+  130: "#cee6f5",
+  140: "#e2f0f9",
+  150: "#f0f7fc",
+  160: "#f8fbfd",
+};
+
+export const appTheme: Theme = {
+  ...createLightTheme(governmentBlue),
+  fontFamilyBase: '"Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif',
+  borderRadiusSmall: "2px",
+  borderRadiusMedium: "4px",
+  borderRadiusLarge: "4px",
+  borderRadiusXLarge: "4px",
+  colorNeutralBackground1: "#ffffff",
+  colorNeutralBackground2: "#f5f7f9",
+  colorNeutralBackground3: "#edf1f4",
+  colorNeutralForeground1: "#172331",
+  colorNeutralForeground2: "#4f5f70",
+  colorNeutralForeground3: "#687786",
+  colorNeutralStroke1: "#d5dde5",
+  colorNeutralStroke2: "#e2e7ec",
+  colorBrandBackground: "#0e5687",
+  colorBrandBackgroundHover: "#0d456c",
+  colorBrandBackgroundPressed: "#0c3452",
+  colorBrandForeground1: "#0e5687",
+  colorBrandStroke1: "#0e5687",
+};

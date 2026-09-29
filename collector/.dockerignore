@@ -1,0 +1,12 @@
+node_modules
+data
+tmp
+captures
+*.db
+*.db-wal
+*.db-shm
+*.har
+*.zip
+*.xls
+*.xlsx
+*.pdf

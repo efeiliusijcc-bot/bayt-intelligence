@@ -1,0 +1,67 @@
+name: bayt-intelligence
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: bayt-intelligence:local
+    restart: unless-stopped
+    init: true
+    environment:
+      APP_USER: ${APP_USER:?APP_USER is required}
+      APP_PASSWORD: ${APP_PASSWORD:?APP_PASSWORD is required}
+      PREVIEW_SECRET: ${PREVIEW_SECRET:?PREVIEW_SECRET is required}
+      COLLECTOR_ENABLED: "1"
+      COLLECTOR_API_URL: http://collector:4191
+      COLLECTOR_API_TOKEN: ${COLLECTOR_API_TOKEN:?COLLECTOR_API_TOKEN is required}
+    ports:
+      - "${BAYT_BIND_ADDRESS:-127.0.0.1}:${BAYT_PORT:-4180}:4180"
+    volumes:
+      - runtime:/app/runtime
+      - type: bind
+        source: ${BAYT_DATA_DIR:-./deployment-data/published}
+        target: /data
+        read_only: true
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 20s
+
+  collector:
+    build:
+      context: ./collector
+      dockerfile: Dockerfile
+    image: bayt-collector:local
+    restart: unless-stopped
+    init: true
+    environment:
+      COLLECTOR_API_TOKEN: ${COLLECTOR_API_TOKEN:?COLLECTOR_API_TOKEN is required}
+    ports:
+      - "127.0.0.1:6080:6080"
+    volumes:
+      - collector-profile:/profile
+      - collector-control:/control
+      - type: bind
+        source: ${BAYT_WORK_DIR:-./deployment-data/work}
+        target: /data/work
+      - type: bind
+        source: ${BAYT_PUBLISHED_DIR:-./deployment-data/published}
+        target: /published
+    shm_size: 1gb
+    mem_limit: 3g
+    cpus: 1.5
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 30s
+
+volumes:
+  runtime:
+  collector-profile:
+  collector-control:

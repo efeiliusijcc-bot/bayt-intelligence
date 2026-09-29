@@ -1,0 +1,16 @@
+{
+  "experimentId": "bayt-windows-capture-soak-v1",
+  "host": "windows-agent",
+  "listenHost": "127.0.0.1",
+  "listenPort": 18080,
+  "serialOnly": true,
+  "maxConcurrency": 1,
+  "searchPagesPerRun": 1,
+  "replaySearchOnce": true,
+  "captureCandidateDetail": false,
+  "exportExcel": false,
+  "exportZip": false,
+  "downloadPdf": false,
+  "downloadAttachment": false,
+  "persistRawCapture": false
+}

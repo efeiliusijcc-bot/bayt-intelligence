@@ -1,0 +1,35 @@
+{
+  "name": "bayt-cv-collector",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "login": "node --experimental-strip-types src/cli.ts login",
+    "preflight": "node --experimental-strip-types src/cli.ts preflight --target 10",
+    "collect": "node --experimental-strip-types src/cli.ts collect --target 500",
+    "resume": "node --experimental-strip-types src/cli.ts resume",
+    "import-staging": "node --experimental-strip-types src/import-staging.ts",
+    "verify": "node --experimental-strip-types src/cli.ts verify",
+    "worker": "node --experimental-strip-types src/worker.ts",
+    "windows-agent": "node --experimental-strip-types src/windows-agent.ts",
+    "test": "node scripts/run-tests.mjs",
+    "check": "npm test && tsc --noEmit"
+  },
+  "engines": {
+    "node": ">=22.18"
+  },
+  "dependencies": {
+    "@e965/xlsx": "^0.20.3",
+    "express": "^5.1.0",
+    "playwright": "1.55.1",
+    "yauzl": "^3.2.0"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.3",
+    "@types/node": "^22.15.3",
+    "@types/yauzl": "^2.10.3",
+    "@types/yazl": "^2.4.5",
+    "typescript": "^5.9.2",
+    "yazl": "^3.3.1"
+  }
+}

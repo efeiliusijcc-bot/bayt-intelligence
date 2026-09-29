@@ -1,0 +1,5 @@
+data/
+diagnostics/
+tmp/
+*.log
+.DS_Store

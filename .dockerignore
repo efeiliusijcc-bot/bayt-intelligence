@@ -1,0 +1,10 @@
+node_modules
+dist
+runtime
+deployment-data
+.env
+*.log
+.DS_Store
+coverage
+Dockerfile*
+compose*.yaml
