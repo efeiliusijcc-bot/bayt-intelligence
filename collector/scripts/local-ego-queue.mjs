@@ -516,6 +516,14 @@ async function activePulse(active) {
   }
   // Register an independent, run-bound uploader before releasing any collection lease.
   if (state.status !== 'prepared') await ensureUploadRegistered(active);
+  const deadline = effectiveDeadline(state);
+  if (active.recoveryPending && deadline && Date.now() >= Date.parse(deadline) && !state.intent) {
+    await runProcess(process.execPath, ['--experimental-strip-types', path.join(here, 'local-ego-soak.mjs'), 'finalize-expired-recovery', active.root]);
+    state = await readJson(path.join(active.root, 'checkpoint.json'));
+    if (state.status === 'completed') {
+      active.recovery = null; active.recoveryPending = false; await atomicJson(activePath, active);
+    }
+  }
   if (active.recoveryPending) {
     try {
       if (job.pauseRequested) {

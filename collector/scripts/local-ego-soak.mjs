@@ -633,6 +633,26 @@ async function verifyRecovery(root) {
   }
 }
 
+export function finishExpiredRecovery(state, now = Date.now()) {
+  if (state.intent || !deadlineReached(effectiveDeadline(state), now)) return false;
+  const phase = resumePhase(state);
+  // An already exported XLS must still be paired with its PDF. This command
+  // never starts a browser action, even when the page is awaiting verification.
+  if (!['next', 'excel_prepare'].includes(phase)) return false;
+  state.phase = phase;
+  return finishIfReady(state, now);
+}
+
+async function finalizeExpiredRecovery(root) {
+  root = path.resolve(root || '');
+  if (!root.startsWith(base + path.sep)) throw Error('RUN_ROOT_OUTSIDE_LOCAL_RUNS');
+  const state = JSON.parse(await fsp.readFile(statePath(root), 'utf8'));
+  await verifyCompletedPages(root, state);
+  if (finishExpiredRecovery(state)) {
+    await save(root, state); await appendLog(root, 'expired_recovery_finalized', { pages: state.pages.length });
+  }
+}
+
 async function waitUntil(root, state) {
   while (!shutdownRequested && state.status === 'running' && Date.now() < Date.parse(state.nextActionAt)) {
     if (finishIfReady(state)) { await save(root, state); return; }
@@ -727,6 +747,7 @@ if (invokedDirectly) {
     else if (command === 'resume-verified') await recover(argument, true);
     else if (command === 'verify-resume') await verifyResume(argument, String(extra || ''));
     else if (command === 'verify-recovery') await verifyRecovery(argument);
+    else if (command === 'finalize-expired-recovery') await finalizeExpiredRecovery(argument);
     else if (command === 'rebind-supervisor') await rebindSupervisor(argument, Number(extra));
     else if (command === 'activate-run') await activateRun(argument, String(extra || ''));
     else if (command === 'retire') await retire(argument);

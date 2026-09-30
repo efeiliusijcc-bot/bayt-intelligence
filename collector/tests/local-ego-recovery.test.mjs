@@ -5,7 +5,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import test from 'node:test';
 import { scheduleRecovery, effectiveDeadline, retryAfterTime, recoveryKind } from '../src/recovery.ts';
-import { finishIfReady } from '../scripts/local-ego-soak.mjs';
+import { finishIfReady, finishExpiredRecovery } from '../scripts/local-ego-soak.mjs';
 
 test('20 minutes initially, then unlimited 10 minute waits survive serialization', () => {
   let now = Date.parse('2026-09-30T00:00:00Z'), r = null;
@@ -38,6 +38,16 @@ test('count jobs have no 48-hour cutoff while explicit duration retains its dead
 });
 
 const script = await fs.readFile(new URL('../scripts/local-ego-recovery-action.mjs', import.meta.url), 'utf8');
+test('an explicit deadline finalizes a pending recovery without another site probe', () => {
+  const state = { schemaVersion: 2, limits: { durationHours: 24 }, deadlineAt: '2020-01-01T00:00:00Z',
+    phase: 'stopped', status: 'awaiting_verification', resumePhase: 'next', pages: [{}], seenIds: ['1'],
+    recovery: { id: 'episode-test' }, current: { page: 1, pdf: {} } };
+  assert.equal(finishExpiredRecovery({ ...state, limits: { targetCount: 150 } }), false);
+  assert.equal(finishExpiredRecovery({ ...state, intent: { format: 'pdf' } }), false);
+  assert.equal(finishExpiredRecovery({ ...state, resumePhase: 'pdf_prepare' }), false);
+  assert.equal(finishExpiredRecovery(state), true);
+  assert.equal(state.status, 'completed'); assert.equal(state.recovery, null);
+});
 async function simulated(directory, recovery, initial, afterLoad, afterClick) {
   let state = initial, clicks = 0, reloads = 0, handoffs = 0, result;
   const previousTask = globalThis.taskSpace, previousConfig = globalThis.BAYT_EGO_ACTION_JSON, previousLog = console.log;
