@@ -15,6 +15,7 @@ const sourceFunction = (source, name, next) => {
 const responseSource = sourceFunction(advanced, 'checkSearchResponse', 'async function guardedStartSearch');
 const verifySource = sourceFunction(advanced, 'verifySession', 'async function checkSearchResponse');
 const stateSource = sourceFunction(action, 'browserState', 'async function inspect');
+const guardedSource = sourceFunction(advanced, 'guardedStartSearch', 'const result =');
 const preferences = '/v6/employer/myAccount/employerPreferences';
 const results = '/v6/cvSearch/test-search/results';
 const resource = (path, status, start = 1) => ({ name: new URL(path, 'https://www.bayt.com').href,
@@ -64,6 +65,28 @@ test('required-endpoint login and rate-limit failures remain stop conditions', a
     await assert.rejects(r.check, error);
     assert.equal(r.state().warning, warning);
   }
+});
+
+test('recent-search rate limit is detected before the form is complete and clears only after recovery', async () => {
+  const recent = '/v6/cvSearch/recentSearches/';
+  const blocked = runtime([resource(recent, 429), resource(preferences, 200, 2)], { searchVisible: false });
+  await assert.rejects(blocked.check, /BAYT_429/);
+  await assert.rejects(blocked.verify, /BAYT_429/);
+  assert.equal(blocked.state().warning, 'RATE_LIMIT');
+  assert.equal(blocked.state().resultResponse.path, recent);
+  assert.equal(blocked.state().resultResponse.status, 429);
+  const recovered = runtime([resource(recent, 429), resource(recent, 200, 2)]);
+  await recovered.check();
+  assert.equal(recovered.state().warning, null);
+});
+
+test('an existing rate limit prevents navigation and search submission', async () => {
+  let searches = 0;
+  const context = vm.createContext({ checkSearchResponse: async () => { throw Error('BAYT_429'); },
+    startSearch: async () => { searches++; return {}; } });
+  vm.runInContext(guardedSource, context);
+  await assert.rejects(() => context.guardedStartSearch(), /BAYT_429/);
+  assert.equal(searches, 0);
 });
 
 test('zero-result counts and filter badges are valid verified search pages', async () => {

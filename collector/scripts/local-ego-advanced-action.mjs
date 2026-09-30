@@ -448,6 +448,7 @@ async function checkSearchResponse() {
     for (const entry of performance.getEntriesByType('resource')) {
       const url = new URL(entry.name, location.href);
       if (url.origin === location.origin && (/^\/v6\/cvSearch\/[^/]+\/results\/?$/.test(url.pathname) ||
+        /^\/v6\/cvSearch\/recentSearches\/?$/.test(url.pathname) ||
         url.pathname === '/v6/employer/myAccount/employerPreferences')) latest.set(url.pathname, entry);
     }
     const last = [...latest.values()].filter(e => [401,403,429].includes(e.responseStatus))
@@ -463,6 +464,9 @@ async function checkSearchResponse() {
 }
 
 async function guardedStartSearch() {
+  // Do not navigate away from an already observed limit/challenge and lose its
+  // evidence. Recent-search loading can be rate limited before the form exists.
+  await checkSearchResponse();
   try { const result = await startSearch(); await checkSearchResponse(); return result; }
   catch (error) { await checkSearchResponse(); throw error; }
 }

@@ -22,6 +22,7 @@ function browserState() {
   for (const entry of performance.getEntriesByType('resource')) {
     const url = new URL(entry.name, location.href);
     if (url.origin === location.origin && (/^\/v6\/cvSearch\/[^/]+\/results\/?$/.test(url.pathname) ||
+      /^\/v6\/cvSearch\/recentSearches\/?$/.test(url.pathname) ||
       url.pathname === '/v6/employer/myAccount/employerPreferences')) latest.set(url.pathname, entry);
   }
   const blockedResponse = [...latest.values()].filter(entry => [401,403,429].includes(entry.responseStatus))
