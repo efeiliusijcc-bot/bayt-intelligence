@@ -7,6 +7,7 @@ import crypto from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { agentId, localPageInput, verificationId, controlRequest as request } from './local-queue-control.mjs';
+import { scheduleRecovery, recoveryKind, effectiveDeadline, retryAfterTime, automaticRecovery } from '../src/recovery.ts';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const base = path.resolve(here, '../../data/local-runs');
@@ -95,7 +96,7 @@ async function runProcess(command, args, stdin = null, timeoutMs = 300_000) {
 }
 
 async function ego(action) {
-  const script = await fsp.readFile(path.join(here, 'local-ego-advanced-action.mjs'), 'utf8');
+  const script = await fsp.readFile(path.join(here, action.action === 'automaticRecovery' ? 'local-ego-recovery-action.mjs' : 'local-ego-advanced-action.mjs'), 'utf8');
   const result = await runProcess('ego-browser', ['nodejs'],
     `globalThis.BAYT_EGO_ACTION_JSON=${JSON.stringify(JSON.stringify({ ...action, spaceId }))};\n${script}`);
   const line = `${result.out}\n${result.err}`.split('\n').find(item => item.startsWith('BAYT_EGO_RESULT='));
@@ -133,7 +134,7 @@ export function assertResumeClaim(job, runId, state, receipts) {
     state?.schemaVersion !== 2 || state.runId !== runId || state.queueJobId !== job.id ||
     state.searchId !== job.searchId || !['safety_stopped', 'operator_stopped', 'awaiting_verification'].includes(state.status) ||
     /UNCERTAIN|RETIRED|MISMATCH|CRC|MAPPING|INVALID/.test(state.stopReason || '') ||
-    state.intent || !Number.isFinite(Date.parse(state.deadlineAt)) ||
+    state.intent || (job.limits?.durationHours && !Number.isFinite(Date.parse(state.deadlineAt))) ||
     JSON.stringify(state.searchSpec) !== JSON.stringify(job.searchSpec) ||
     JSON.stringify(state.limits) !== JSON.stringify(job.limits)) throw Error('CHECKPOINT_RESUME_IDENTITY_INVALID');
   const pages = state.pages || [];
@@ -259,7 +260,7 @@ async function startRun(job, leaseToken) {
     throw Error('SEARCH_RESULT_IDENTITY_UNVERIFIED');
   }
   const inputPath = path.join(queueDir, `init-${job.id}.json`);
-  await atomicJson(inputPath, { spaceId, job: { id: job.id, searchSpec: job.searchSpec, limits: job.limits },
+  await atomicJson(inputPath, { spaceId, job: { id: job.id, searchSpec: job.searchSpec, limits: job.limits, startedAt: job.startedAt },
     actualKeyword: result.keyword, supervisorPid: process.pid });
   let root;
   try {
@@ -376,17 +377,89 @@ async function terminal(active, code, message) {
   await fsp.unlink(activePath);
 }
 
+async function scheduleActiveRecovery(active, error) {
+  const kind = recoveryKind(String(error.message || error));
+  if (!kind) return false;
+  active.recovery = scheduleRecovery(active.recovery, kind, active.root ? 'checkpoint_resume' : 'start_search', crypto.randomUUID());
+  await atomicJson(activePath, active);
+  return true;
+}
+
+async function checkActiveRecovery(active) {
+  const r = active.recovery;
+  if (!r) return 'ready';
+  if (Date.now() < Date.parse(r.nextCheckAt)) return 'waiting';
+  if (r.stage !== 'probing') { r.stage = 'probing'; r.attempts++; await atomicJson(activePath, active); }
+  const result = await ego({ action: 'automaticRecovery', recovery: r,
+    attemptDirectory: path.join(active.root || queueDir, 'recovery-attempts') });
+  if (result.kind === 'rate_limit') {
+    active.recovery = scheduleRecovery(r, 'rate_limit', r.resumePhase, r.id, Date.now(), retryAfterTime(result.retryAfter));
+    await atomicJson(activePath, active); return 'waiting';
+  }
+  if (result.kind !== 'ready') {
+    r.stage = 'manual_required'; await atomicJson(activePath, active);
+    await handOffStartChallenge(active.jobId, { code: 'BAYT_VERIFICATION_REQUIRED', rayId: result.rayId });
+    await terminal(active, 'BAYT_VERIFICATION_REQUIRED', '自动验证未完成或需要登录，已交还 Ego');
+    return 'manual';
+  }
+  active.recovery = null; active.userVerified = true;
+  await atomicJson(activePath, active);
+  return 'ready';
+}
+
+async function startupPulse(active) {
+  const job = await request(`/jobs/${encodeURIComponent(active.jobId)}/heartbeat`, { agentId,
+    evidence: { phase: active.recovery ? 'automatic_recovery' : 'start_search', recovery: active.recovery || null,
+      noDownloadIntent: true, nextActionAt: active.recovery?.nextCheckAt || null } }, active.leaseToken);
+  if (job.pauseRequested) {
+    await request(`/jobs/${encodeURIComponent(active.jobId)}/pause-ack`, { agentId }, active.leaseToken);
+    await fsp.unlink(activePath); return null;
+  }
+  if (job.limits.durationHours && Date.now() >= Date.parse(job.startedAt) + job.limits.durationHours * 3_600_000) {
+    await terminal(active, 'JOB_HAS_NO_COMPLETE_PAGE', '持续时长已到，搜索阶段未产生完整页面'); return null;
+  }
+  try {
+    const outcome = await checkActiveRecovery(active);
+    if (outcome === 'manual') return null;
+    if (outcome === 'waiting') return active;
+    return await startRun(job, active.leaseToken);
+  } catch (error) {
+    const saved = await readJson(activePath);
+    if (saved.root) return saved; // A prepared run must never be replaced by another search.
+    if (await scheduleActiveRecovery(active, error)) return active;
+    const failure = startSearchFailure(error);
+    if (failure.code === 'BAYT_VERIFICATION_REQUIRED') await handOffStartChallenge(active.jobId, failure);
+    await terminal(active, failure.code, failure.message); return null;
+  }
+}
+
 async function activePulse(active) {
   let state = await readJson(path.join(active.root, 'checkpoint.json'));
   const job = await request(`/jobs/${encodeURIComponent(active.jobId)}/heartbeat`, {
     agentId, evidence: { searchId: active.searchId, matchedCount: active.matchedCount,
-      actualFilterLabels: active.actualFilterLabels, phase: state.phase, nextActionAt: state.nextActionAt } }, active.leaseToken);
+      actualFilterLabels: active.actualFilterLabels, phase: active.recovery || state.recovery ? 'automatic_recovery' : state.phase,
+      recovery: active.recovery || state.recovery || null, noDownloadIntent: !state.intent,
+      nextActionAt: active.recovery?.nextCheckAt || state.nextActionAt } }, active.leaseToken);
   await atomicJson(path.join(active.root, 'control-lease.json'), { confirmedAt: new Date().toISOString() });
   if (job.pauseRequested) await atomicJson(path.join(active.root, 'stop-requested.json'), { at: new Date().toISOString(), reason: 'queue_pause' });
+  if (state.status === 'safety_stopped' && automaticRecovery(state.recovery) &&
+    ['LOCAL_LEASE_HEARTBEAT_LOST', 'QUEUE_SUPERVISOR_LOST'].includes(state.stopReason) && !state.intent) {
+    await runProcess(process.execPath, ['--experimental-strip-types', path.join(here, 'local-ego-soak.mjs'), 'rebind-supervisor', active.root, String(process.pid)]);
+    state = await readJson(path.join(active.root, 'checkpoint.json'));
+  }
   // Register an independent, run-bound uploader before releasing any collection lease.
   if (state.status !== 'prepared') await ensureUploadRegistered(active);
   if (active.recoveryPending) {
     try {
+      if (job.pauseRequested) {
+        await request(`/jobs/${encodeURIComponent(active.jobId)}/pause-ack`, { agentId }, active.leaseToken);
+        await fsp.unlink(activePath); return false;
+      }
+      if (active.recovery) {
+        const outcome = await checkActiveRecovery(active);
+        if (outcome === 'manual') return false;
+        if (outcome === 'waiting') return true;
+      }
       if (['safety_stopped', 'operator_stopped', 'awaiting_verification'].includes(state.status)) {
         await runProcess(process.execPath, ['--experimental-strip-types', path.join(here, 'local-ego-soak.mjs'), active.userVerified ? 'resume-verified' : 'recover', active.root]);
         state = await readJson(path.join(active.root, 'checkpoint.json'));
@@ -402,6 +475,7 @@ async function activePulse(active) {
       active.recoveryPending = false;
       await atomicJson(activePath, active);
     } catch (error) {
+      if (await scheduleActiveRecovery(active, error)) return true;
       const failure = startSearchFailure(error);
       if (failure.code === 'BAYT_VERIFICATION_REQUIRED') await handOffStartChallenge(active.jobId, failure);
       await terminal(active, ['BAYT_VERIFICATION_REQUIRED', 'BAYT_429'].includes(failure.code) ? failure.code : 'CHECKPOINT_RESUME_BLOCKED', String(error.message).slice(0, 180));
@@ -507,11 +581,12 @@ async function main() {
       await restoreUploadBacklogs();
       const needsVerification = await verificationPending();
       const marker = needsVerification ? await readJson(path.join(queueDir, 'awaiting-verification.json')) : null;
-      await request('/heartbeat', { agentId, name: '本机 Ego Agent', version: '3', currentJobId: active?.jobId || null,
-        chromeReady: enabled && !needsVerification,
+      const currentRecovery = active?.recovery || (active?.root ? (await readJson(path.join(active.root, 'checkpoint.json'))).recovery : null);
+      await request('/heartbeat', { agentId, name: '本机 Ego Agent', version: '4', currentJobId: active?.jobId || null,
+        chromeReady: enabled && !needsVerification && !currentRecovery,
         loginState: !enabled ? 'login_required' : needsVerification ? 'verification_required' : 'logged_in',
-        verificationId: marker ? verificationId(marker) : null, waitReason: needsVerification ? marker.lastVerificationFailedAt ? 'verification_failed' : 'verification_required' : waitReason,
-        nextActionAt: waitUntil });
+        verificationId: marker ? verificationId(marker) : null, waitReason: needsVerification ? marker.lastVerificationFailedAt ? 'verification_failed' : 'verification_required' : currentRecovery ? 'automatic_recovery' : waitReason,
+        nextActionAt: currentRecovery?.nextCheckAt || waitUntil });
       if (!enabled) { await delay(30_000); continue; }
       if (needsVerification) {
         if (active) {
@@ -521,7 +596,8 @@ async function main() {
         await handleVerificationRequest(); await delay(30_000); continue;
       }
       if (active) {
-        if (!(await withLeaseHeartbeat(active, () => activePulse(active)))) active = null;
+        if (active.startPending) active = await withLeaseHeartbeat(active, () => startupPulse(active));
+        else if (!(await withLeaseHeartbeat(active, () => activePulse(active)))) active = null;
       } else if (!(await blockedByExistingRun())) {
         await syncCatalog();
         const claim = await request('/jobs/claim', { agentId });
@@ -535,9 +611,13 @@ async function main() {
             catch (error) { console.error(JSON.stringify({ event: 'lease_heartbeat_error', code: String(error.message).slice(0, 80) })); }
             finally { heartbeatBusy = false; }
           }, 30_000);
-          try { active = claim.resumeRunId
-            ? await startResume(claim.job, claim.leaseToken, claim.resumeRunId)
-            : await startRun(claim.job, claim.leaseToken); }
+          try {
+            if (claim.resumeRunId) active = await startResume(claim.job, claim.leaseToken, claim.resumeRunId);
+            else {
+              active = { jobId: claim.job.id, leaseToken: claim.leaseToken, startPending: true, recovery: null };
+              await atomicJson(activePath, active);
+            }
+          }
           catch (error) {
             let persisted = null;
             try { persisted = await readJson(activePath); }
@@ -566,7 +646,22 @@ async function main() {
       if (active && /INVALID_JOB_LEASE|CONTROL_HTTP_409/.test(String(error.message))) {
         try {
           const remote = await request(`/jobs/${encodeURIComponent(active.jobId)}/state`, { agentId });
-          const local = await readJson(path.join(active.root, 'checkpoint.json'));
+          const local = active.root ? await readJson(path.join(active.root, 'checkpoint.json')) : { status: 'prepared' };
+          if (remote.status === 'cancelled') {
+            if (active.root) await atomicJson(path.join(active.root, 'stop-requested.json'), { at: new Date().toISOString(), reason: 'cancelled' });
+            await fsp.unlink(activePath); active = null; continue;
+          }
+          const recovery = active.recovery || local.recovery;
+          if (automaticRecovery(recovery) && !local.intent && ['running', 'pause_requested'].includes(remote.status)) {
+            if (active.root) await runProcess(process.execPath, ['--experimental-strip-types', path.join(here, 'local-ego-soak.mjs'), 'verify-recovery', active.root]);
+            if (!active.reclaimToken) { active.reclaimToken = crypto.randomBytes(32).toString('base64url'); await atomicJson(activePath, active); }
+            await request(`/jobs/${encodeURIComponent(active.jobId)}/recovery/claim`,
+              { agentId, newLeaseToken: active.reclaimToken, recoveryId: recovery.id }, active.leaseToken);
+            active.leaseToken = active.reclaimToken; delete active.reclaimToken;
+            active.needsRebind = true; await atomicJson(activePath, active);
+            if (active.root) await atomicJson(path.join(active.root, 'control-lease.json'), { confirmedAt: new Date().toISOString() });
+            continue;
+          }
           if (terminalAcknowledged(active, local, remote)) {
             if (local.status === 'awaiting_verification') await atomicJson(path.join(queueDir, 'awaiting-verification.json'), {
               jobId: active.jobId, at: new Date().toISOString(), status: 'awaiting_verification',

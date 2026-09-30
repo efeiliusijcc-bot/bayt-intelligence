@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { automaticRecovery, validRecovery, type BrowserRecovery } from "../collector/src/recovery.ts";
 
 export type FilterControlType = "single" | "multi" | "range" | "search" | "unsupported";
 export type ScheduleKind = "once" | "daily" | "weekly";
@@ -162,6 +163,7 @@ export interface CollectionJob {
   nextActionAt: string | null;
   deliveryError: string | null;
   resumeMode: "new_search" | "checkpoint" | "review";
+  recovery: BrowserRecovery | null;
 }
 
 export interface AgentState {
@@ -542,7 +544,7 @@ export class CollectorControlStore {
     const jobColumns = this.db.prepare("PRAGMA table_info(collector_jobs)").all() as Array<{ name: string }>;
     if (!jobColumns.some((column) => column.name === "client_request_id")) this.db.exec("ALTER TABLE collector_jobs ADD COLUMN client_request_id TEXT");
     this.db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_collector_jobs_client_request ON collector_jobs(client_request_id) WHERE client_request_id IS NOT NULL");
-    for (const name of ["collection_finished_at", "collection_phase", "next_action_at", "delivery_error"])
+    for (const name of ["collection_finished_at", "collection_phase", "next_action_at", "delivery_error", "recovery_json"])
       if (!jobColumns.some(column => column.name === name)) this.db.exec(`ALTER TABLE collector_jobs ADD COLUMN ${name} TEXT`);
     const runColumns = this.db.prepare("PRAGMA table_info(collector_job_runs)").all() as Array<{ name: string }>;
     for (const name of ["agent_id", "upload_token_hash", "finished_json"])
@@ -890,6 +892,7 @@ export class CollectorControlStore {
       phase: row.collection_phase ? String(row.collection_phase) : null,
       nextActionAt: row.next_action_at ? String(row.next_action_at) : null,
       deliveryError: row.delivery_error ? String(row.delivery_error) : null,
+      recovery: parseJson<BrowserRecovery | null>(row.recovery_json, null),
       resumeMode: !row.search_id ? "new_search" : runs.count === 1 &&
         (row.status === "paused" || checkpointResumeCodes.has(String(row.error_code || ""))) ? "checkpoint" : "review",
     };
@@ -948,8 +951,9 @@ export class CollectorControlStore {
 
   cancelJob(id: string): CollectionJob {
     const job = this.getJob(id);
-    if (!job || job.status !== "queued") throw new CollectorControlError("只有待执行任务可以取消", "JOB_NOT_CANCELLABLE", 409);
-    this.db.prepare("UPDATE collector_jobs SET status = 'cancelled', queue_position = NULL, completed_at = ? WHERE id = ?").run(nowIso(), id);
+    if (!job || !(job.status === "queued" || job.status === "paused" || (job.status === "running" && job.recovery)))
+      throw new CollectorControlError("只有待执行、等待恢复或已暂停任务可以取消", "JOB_NOT_CANCELLABLE", 409);
+    this.db.prepare("UPDATE collector_jobs SET status = 'cancelled', queue_position = NULL, lease_token_hash = NULL, lease_expires_at = NULL, completed_at = ? WHERE id = ?").run(nowIso(), id);
     this.normalizeQueue();
     return this.getJob(id)!;
   }
@@ -1107,15 +1111,38 @@ export class CollectorControlStore {
 
   recoverExpiredLeases(at = new Date()): number {
     const expired = this.db.prepare("SELECT id FROM collector_jobs WHERE status IN ('running','pause_requested') AND lease_expires_at < ?").all(at.toISOString()) as { id: string }[];
+    let unsafe = 0;
     for (const item of expired) {
+      // Durable no-download recovery retains ownership across a restart. It
+      // can only be reclaimed with the previous lease proof, never by another job.
+      if (automaticRecovery(this.getJob(item.id)?.recovery)) continue;
+      unsafe++;
       this.db.prepare(`UPDATE collector_jobs SET status = 'safety_stopped', queue_position = NULL, pause_requested = 0,
         agent_id = NULL, lease_token_hash = NULL, lease_expires_at = NULL,
         error_code = 'LEASE_EXPIRED_REVIEW', error_message = '租约过期；需核对本机下载意图与完整页检查点后人工恢复' WHERE id = ?`)
         .run(item.id);
     }
-    if (expired.length) this.db.prepare("UPDATE collector_control_state SET globally_paused = 1, pause_code = 'LEASE_EXPIRED_REVIEW', pause_message = '本机采集租约过期，检查未确定下载后再恢复', paused_at = ?, updated_at = ? WHERE singleton = 1")
+      if (unsafe) this.db.prepare("UPDATE collector_control_state SET globally_paused = 1, pause_code = 'LEASE_EXPIRED_REVIEW', pause_message = '本机采集租约过期，检查未确定下载后再恢复', paused_at = ?, updated_at = ? WHERE singleton = 1")
       .run(nowIso(), nowIso());
-    return expired.length;
+    return unsafe;
+  }
+
+  reclaimRecovery(jobId: string, agentId: string, oldToken: string, newToken: string, recoveryId: string): CollectionJob {
+    if (!/^[A-Za-z0-9_-]{43,128}$/.test(newToken)) throw new CollectorControlError("恢复令牌无效", "RECOVERY_TOKEN_INVALID", 409);
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const job = this.getJob(jobId);
+      const row = this.db.prepare("SELECT lease_token_hash FROM collector_jobs WHERE id = ?").get(jobId) as { lease_token_hash: string } | undefined;
+      const other = this.db.prepare("SELECT id FROM collector_jobs WHERE id != ? AND status IN ('running','pause_requested') LIMIT 1").get(jobId);
+      if (!job || job.agentId !== agentId || !["running", "pause_requested"].includes(job.status) ||
+        !automaticRecovery(job.recovery) || job.recovery.id !== recoveryId || !row || other || this.getControlState().globallyPaused ||
+        ![hashToken(oldToken), hashToken(newToken)].includes(row.lease_token_hash))
+        throw new CollectorControlError("自动恢复身份、检查点或安全状态已改变", "RECOVERY_RECLAIM_BLOCKED", 409);
+      this.db.prepare("UPDATE collector_jobs SET lease_token_hash = ?, lease_expires_at = ? WHERE id = ?")
+        .run(hashToken(newToken), new Date(Date.now() + 120_000).toISOString(), jobId);
+      this.db.exec("COMMIT");
+      return this.getJob(jobId)!;
+    } catch (error) { this.db.exec("ROLLBACK"); throw error; }
   }
 
   dailyExportedCount(at = new Date()): number {
@@ -1278,6 +1305,12 @@ export class CollectorControlStore {
 
   heartbeatJob(jobId: string, agentId: string, leaseToken: string, evidence: Record<string, unknown> = {}, leaseMs = 120_000): CollectionJob {
     const job = this.verifyLease(jobId, agentId, leaseToken);
+    if (evidence.recovery !== undefined) {
+      if (evidence.recovery !== null && (!validRecovery(evidence.recovery) || evidence.noDownloadIntent !== true))
+        throw new CollectorControlError("恢复检查点不完整或存在下载意图", "RECOVERY_EVIDENCE_INVALID", 409);
+      this.db.prepare("UPDATE collector_jobs SET recovery_json = ? WHERE id = ?")
+        .run(evidence.recovery ? JSON.stringify(evidence.recovery) : null, jobId);
+    }
     if (job.searchId && evidence.searchId && evidence.searchId !== job.searchId)
       throw new CollectorControlError("搜索标识变化", "RUN_JOB_LINK_INVALID", 409);
     this.db.prepare(`UPDATE collector_jobs SET lease_expires_at = ?, search_id = COALESCE(?, search_id),

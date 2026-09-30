@@ -10,6 +10,50 @@ import { CollectorControlError, CollectorControlStore, type SearchSpec } from ".
 import { config } from "./config.ts";
 import { parseExcelCandidates } from "./import-service.ts";
 import { verifyIncomingBatch } from "./collector-upload-verifier.ts";
+import { scheduleRecovery } from "../collector/src/recovery.ts";
+
+test("限流等待租约过期可凭原凭据恢复；不释放给其他任务、不解除安全暂停", () => {
+  const { store, directory, version } = fixtureStore();
+  try {
+    const first = store.createJob({ name: "recovery", searchSpec: spec(version), limits: { targetCount: 100 } });
+    const second = store.createJob({ name: "next", searchSpec: spec(version), limits: { targetCount: 100 } });
+    const claim = store.claimJob("local-ego-test");
+    assert.equal(claim.job?.id, first.id);
+    const recovery = scheduleRecovery(null, "rate_limit", "start_search", "episode-test");
+    store.heartbeatJob(first.id, "local-ego-test", claim.leaseToken!, { recovery, noDownloadIntent: true }, -1000);
+    assert.equal(store.recoverExpiredLeases(), 0);
+    assert.equal(store.getControlState().globallyPaused, false);
+    assert.equal(store.claimJob("local-ego-test").job, null);
+    const nextToken = crypto.randomBytes(32).toString("base64url");
+    assert.throws(() => store.reclaimRecovery(first.id, "local-ego-other", claim.leaseToken!, nextToken, recovery.id), /身份/);
+    assert.throws(() => store.reclaimRecovery(first.id, "local-ego-test", "wrong", nextToken, recovery.id), /身份/);
+    store.reclaimRecovery(first.id, "local-ego-test", claim.leaseToken!, nextToken, recovery.id);
+    store.reclaimRecovery(first.id, "local-ego-test", claim.leaseToken!, nextToken, recovery.id); // Lost response is idempotent.
+    assert.equal(store.getJob(first.id)?.recovery?.nextCheckAt, recovery.nextCheckAt);
+    assert.throws(() => store.heartbeatJob(first.id, "local-ego-test", nextToken, { recovery, noDownloadIntent: false }), /下载意图/);
+    store.cancelJob(first.id);
+    assert.throws(() => store.reclaimRecovery(first.id, "local-ego-test", nextToken, nextToken, recovery.id), /身份/);
+    assert.equal(store.claimJob("local-ego-test").job?.id, second.id);
+  } finally { store.close(); fs.rmSync(directory, { recursive: true, force: true }); }
+});
+
+test("等待中暂停仍生效，正常采集租约过期继续要求人工复核", () => {
+  const { store, directory, version } = fixtureStore();
+  try {
+    const job = store.createJob({ name: "recovery", searchSpec: spec(version), limits: { targetCount: 100 } });
+    const claim = store.claimJob("local-ego-test");
+    const recovery = scheduleRecovery(null, "rate_limit", "start_search", "episode-test");
+    store.heartbeatJob(job.id, "local-ego-test", claim.leaseToken!, { recovery, noDownloadIntent: true });
+    store.pauseJob(job.id); store.acknowledgePause(job.id, "local-ego-test", claim.leaseToken!);
+    assert.equal(store.getJob(job.id)?.status, "paused");
+    store.cancelJob(job.id);
+    store.createJob({ name: "ordinary", searchSpec: spec(version), limits: { targetCount: 100 } });
+    const next = store.claimJob("local-ego-test", -1000);
+    assert.equal(store.recoverExpiredLeases(), 1);
+    assert.equal(store.getJob(next.job!.id)?.status, "safety_stopped");
+    assert.equal(store.getControlState().globallyPaused, true);
+  } finally { store.close(); fs.rmSync(directory, { recursive: true, force: true }); }
+});
 
 function fixtureStore(): { store: CollectorControlStore; directory: string; version: string } {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "bayt-control-"));

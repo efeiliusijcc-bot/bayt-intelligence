@@ -99,6 +99,12 @@ export function createCollectorAgentRouter(store: CollectorControlStore, token: 
     }
   });
 
+  router.post("/jobs/:id/recovery/claim", (request, response, next) => {
+    try { response.json(store.reclaimRecovery(String(request.params.id), bodyAgentId(request), leaseToken(request),
+      String(request.body?.newLeaseToken || ""), String(request.body?.recoveryId || ""))); }
+    catch (error) { next(error); }
+  });
+
   router.post("/jobs/:id/state", (request, response, next) => {
     try { response.json(store.agentJobState(String(request.params.id), bodyAgentId(request))); }
     catch (error) { next(error); }

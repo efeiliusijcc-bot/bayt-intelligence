@@ -1,4 +1,5 @@
 import { useMemo, useRef, useState, type FormEvent } from "react";
+import { CollectorRecoveryStatus } from "../components/CollectorRecoveryStatus";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Badge, Button, Checkbox, Input, ProgressBar } from "@fluentui/react-components";
 import {
@@ -163,7 +164,7 @@ export function CollectorPage() {
 
     <section className="section-panel">
       <div className="section-heading collector-template-heading"><div><h2>搜索模板库与采集范围</h2><p>发布时生成不可变条件快照；匹配人数由执行中的本机 Agent 回报，不在发布前请求官网。</p></div><LimitsEditor targetCount={targetCount} maxPages={maxPages} durationHours={durationHours} setTargetCount={setTargetCount} setMaxPages={setMaxPages} setDurationHours={setDurationHours} /></div>
-      <div className="collector-soft-limit">人数/页数任务保留每日500人上限；持续时长任务按整页完成，不限制人数，但429、验证码、登录和文件校验仍会安全停止。</div>
+      <div className="collector-soft-limit">人数/页数任务保留每日500人上限，不设内部48小时截止；429首次等待20分钟，之后每10分钟自动检查。普通验证框自动尝试一次；登录或数据校验异常需要处理。持续时长任务按整页完成，保留原截止时间。</div>
       {templatesQuery.isPending ? <ProgressBar /> : templatesQuery.isError ? <div className="inline-error">{templatesQuery.error.message}</div> : templatesQuery.data?.items.length ? <div className="collector-template-list">{templatesQuery.data.items.map((template) =>
         <TemplateCard key={template.id} template={template} catalog={catalog} disabled={!limits || mutation.isPending || !catalogReady}
           onEdit={() => editTemplate(template)} onCopy={() => mutation.mutate(() => apiClient.copyCollectorSearchTemplate(template.id))}
@@ -286,6 +287,7 @@ function QueueTable({ jobs, busy, action }: { jobs: CollectionQueueJob[]; busy: 
         <td>{job.queuePosition ? `#${job.queuePosition}` : activeStatuses.has(job.status) ? "执行中" : "—"}</td>
         <td><Link className="collector-job-link" to={`/collector/jobs/${encodeURIComponent(job.id)}`}>{job.name}</Link><span className="table-subtext">{job.searchSpec.keyword || job.searchSpec.name || "高级筛选"}{job.searchSpec.approximateLocationKeyword ? ` · 近似匹配：${job.searchSpec.approximateLocationKeyword}` : ""}</span></td>
         <td><QueueStatus status={job.status} />{job.status === "completed" && <span className="table-subtext">采集已结束，不等待上传入库</span>}
+          <CollectorRecoveryStatus recovery={job.recovery} />
           {job.errorMessage && <span className="table-subtext">{job.errorCode}：{job.errorMessage}</span>}
           {job.nextActionAt && <span className="table-subtext">下次动作：{new Date(job.nextActionAt).toLocaleString("zh-CN")}</span>}</td>
         <td>{job.collectedPages ?? job.completedPages} 页<span className="table-subtext">已校验 {count} 人</span></td>
@@ -295,6 +297,7 @@ function QueueTable({ jobs, busy, action }: { jobs: CollectionQueueJob[]; busy: 
         <td><div className="table-actions">
           {job.status === "queued" && <><Button size="small" aria-label="上移" icon={<ArrowUp24Regular />} disabled={busy} onClick={() => action(job, "move-up")} /><Button size="small" aria-label="下移" icon={<ArrowDown24Regular />} disabled={busy} onClick={() => action(job, "move-down")} /><Button size="small" disabled={busy} onClick={() => action(job, "cancel")}>取消</Button></>}
           {job.status === "running" && <Button size="small" icon={<Pause24Regular />} disabled={busy} onClick={() => action(job, "pause")}>暂停</Button>}
+          {(job.status === "paused" || (job.status === "running" && job.recovery)) && <Button size="small" disabled={busy} onClick={() => action(job, "cancel")}>取消</Button>}
           {stopped && resumable && <Button size="small" icon={<Play24Regular />} disabled={busy} onClick={() => action(job, "resume")}>{job.searchId ? "核验续跑" : "恢复排队"}</Button>}
           {stopped && !resumable && <span className="table-subtext">需人工核对检查点</span>}
         </div></td>
@@ -303,7 +306,7 @@ function QueueTable({ jobs, busy, action }: { jobs: CollectionQueueJob[]; busy: 
 }
 
 export function queueWaitLabel(reason: string): string {
-  const labels: Record<string, string> = { browser_cooldown: "上一任务采集已结束，等待原定采集间隔", verification_required: "等待官网验证确认",
+  const labels: Record<string, string> = { automatic_recovery: "官网自动恢复中，其他任务按顺序等待，无需手动恢复", browser_cooldown: "上一任务采集已结束，等待原定采集间隔", verification_required: "等待官网验证确认",
     verification_failed: "官网页面核验未通过，已交还 Ego；处理后可再次确认",
     another_job_running: "等待当前任务释放采集租约", global_safety_pause: "全局安全暂停，任务仅排队", daily_limit: "今日额度已用完",
     catalog_unavailable: "筛选目录过期或不可用，请同步目录", search_requires_revalidation: "排队任务条件需重新校验",

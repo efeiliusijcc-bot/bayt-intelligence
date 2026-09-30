@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { CollectorRecoveryStatus } from "../components/CollectorRecoveryStatus";
 import { useQuery } from "@tanstack/react-query";
 import { Badge, Button } from "@fluentui/react-components";
 import { ArrowLeft24Regular, DocumentPdf24Regular } from "@fluentui/react-icons";
@@ -24,6 +25,7 @@ export function CollectorJobDetailPage() {
     <Link to="/collector" className="back-link"><ArrowLeft24Regular />返回采集任务</Link>
     <div className="page-heading"><div><h1>{current.name}</h1><p>{current.searchSpec.keyword || current.searchSpec.name || "高级筛选"} · {current.id}</p></div><Badge appearance="tint">{current.status}</Badge></div>
     <section className="section-panel">
+      <CollectorRecoveryStatus recovery={current.recovery} />
       <p>本机已校验 {current.collectedCount ?? current.exportedCount} 人；已上传 {current.uploadedCount} 页，待上传 {Math.max(0, (current.collectedPages ?? current.completedPages) - current.uploadedCount)} 页。{current.collectionFinishedAt ? "采集已结束，上传和入库独立继续。" : ""}</p>
       {current.deliveryError && <div className="inline-error" role="alert">{current.deliveryError}</div>}
       <div className="section-heading"><div><h2>简历复核</h2><p>只列出 108 已完成校验入库、且 Bayt PDF 可用的人物。点击人物可直接打开简历附件。</p></div></div>

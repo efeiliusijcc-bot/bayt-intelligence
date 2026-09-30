@@ -9,6 +9,7 @@ import { fileURLToPath } from 'node:url';
 import { parseExcelExport } from '../src/excel.ts';
 import { verifyBulkBatch, writeBulkManifest } from '../src/bulk-batch.ts';
 import { sha256File } from '../src/files.ts';
+import { scheduleRecovery, recoveryKind, effectiveDeadline, retryAfterTime, automaticRecovery } from '../src/recovery.ts';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const uiScript = await fsp.readFile(path.join(here, 'local-ego-action.mjs'), 'utf8');
@@ -21,10 +22,10 @@ export const POLICY = Object.freeze({
   pageMinMs: 60 * 60_000,
   pageMaxMs: 70 * 60_000,
   transientWaitsMs: [2 * 60_000, 5 * 60_000, 15 * 60_000],
-  rateWaitsMs: [15 * 60_000, 30 * 60_000, 60 * 60_000],
+  rateWaitsMs: [20 * 60_000, 10 * 60_000],
 });
 export const jitter = (min, max) => crypto.randomInt(min, max + 1);
-export const deadlineReached = (deadlineAt, now = Date.now()) => now >= Date.parse(deadlineAt);
+export const deadlineReached = (deadlineAt, now = Date.now()) => !!deadlineAt && now >= Date.parse(deadlineAt);
 export function classifyFailure(message) {
   if (/BAYT_RATE_LIMIT|\b429\b/i.test(message)) return 'rate_limit';
   if (/BAYT_CAPTCHA|BAYT_LOGIN_REQUIRED|BAYT_QUOTA_OR_PURCHASE|\b403\b|SEARCH_IDENTITY_CHANGED|FILTER_CHANGED|PAGE_MEMBERS_CHANGED|OVERLAP|CV_ID_INVALID|MAPPING|CRC|PURCHASE/i.test(message)) return 'safety';
@@ -79,6 +80,7 @@ async function heartbeat(root, state) {
     route: 'local_ego_browser',
     upload: `${uploadedPages}/${state.pages.length} pages uploaded independently; 108 collector safety pause unchanged`,
     challenge: state.challenge || null,
+    recovery: state.recovery || null,
   });
 }
 
@@ -118,7 +120,9 @@ async function ego(action) {
       try { resolve(JSON.parse(line.slice('BAYT_EGO_RESULT='.length))); }
       catch { reject(Error('EGO_RESULT_INVALID')); }
     });
-    child.stdin.end(`globalThis.BAYT_EGO_ACTION_JSON=${JSON.stringify(JSON.stringify(action))};\n${uiScript}`);
+    const script = action.action === 'automaticRecovery'
+      ? fs.readFileSync(path.join(here, 'local-ego-recovery-action.mjs'), 'utf8') : uiScript;
+    child.stdin.end(`globalThis.BAYT_EGO_ACTION_JSON=${JSON.stringify(JSON.stringify(action))};\n${script}`);
   });
 }
 
@@ -246,10 +250,10 @@ async function initJob(input) {
   const root = path.join(base, runId);
   await fsp.mkdir(root, { mode: 0o700 });
   const startedAt = new Date();
-  const deadlineMs = job.limits.durationHours ? job.limits.durationHours * HOUR : 48 * HOUR;
+  const deadlineMs = job.limits.durationHours ? job.limits.durationHours * HOUR : null;
   const state = { schemaVersion: 2, runId, spaceId, queueJobId: job.id, supervisorPid,
     keyword: baseline.keyword, searchId: baseline.searchId, searchSpec: job.searchSpec, limits: job.limits,
-    startedAt: startedAt.toISOString(), deadlineAt: new Date(startedAt.getTime() + deadlineMs).toISOString(),
+    startedAt: startedAt.toISOString(), deadlineAt: deadlineMs ? new Date(Date.parse(job.startedAt || startedAt.toISOString()) + deadlineMs).toISOString() : null,
     status: 'prepared', phase: 'excel_prepare', nextActionAt: startedAt.toISOString(),
     current: { page: 1, ids: page.ids, firstSeenAt: startedAt.toISOString(), excel: null, pdf: null },
     pages: [], seenIds: [], intent: null, failures: 0, rateLimits: 0, stopReason: null };
@@ -330,7 +334,7 @@ export function finishIfReady(state, now = Date.now()) {
   const limit = state.phase === 'next' && state.limits &&
     ((state.limits.maxPages && state.pages.length >= state.limits.maxPages) ||
       (state.limits.targetCount && state.seenIds.length >= state.limits.targetCount));
-  const expired = ['next', 'excel_prepare'].includes(state.phase) && deadlineReached(state.deadlineAt, now);
+  const expired = ['next', 'excel_prepare'].includes(state.phase) && deadlineReached(effectiveDeadline(state), now);
   if (limit || expired) {
     if (state.phase === 'next' && state.nextActionAt) state.browserCooldownUntil = state.nextActionAt;
     state.status = 'completed'; state.phase = 'finished'; state.nextActionAt = null;
@@ -344,6 +348,7 @@ async function step(root, state) {
   if (finishIfReady(state)) {
     await save(root, state); await appendLog(root, 'collection_completed', { pages: state.pages.length, count: state.seenIds.length }); return;
   }
+  if (state.recovery) { await probeRecovery(root, state); return; }
   const common = { spaceId: state.spaceId, searchId: state.searchId, keyword: state.keyword, schemaVersion: state.schemaVersion,
     page: current.page, ids: current.ids };
   if (state.phase === 'excel_prepare' || state.phase === 'pdf_prepare') {
@@ -372,7 +377,7 @@ async function step(root, state) {
     return;
   }
   if (state.phase === 'next') {
-    if (deadlineReached(state.deadlineAt)) {
+    if (deadlineReached(effectiveDeadline(state))) {
       state.status = 'completed'; state.phase = 'finished'; state.nextActionAt = null;
       await save(root, state); await appendLog(root, 'duration_completed', { total: state.seenIds.length });
       return;
@@ -408,6 +413,11 @@ async function handleError(root, state, error) {
     await stop(root, state, 'UNCERTAIN_DOWNLOAD_RESULT');
     return;
   }
+  const recoverable = recoveryKind(message);
+  if (recoverable) {
+    await enterRecovery(root, state, recoverable);
+    return;
+  }
   if (/EGO_USER_CONTROL_REQUIRED|BAYT_LOGIN_REQUIRED/.test(message)) {
     await awaitVerification(root, state, { at: new Date().toISOString(), status: null, rayId: null }, 'EGO_USER_CONTROL_REQUIRED');
     return;
@@ -431,6 +441,43 @@ async function handleError(root, state, error) {
   state.nextActionAt = new Date(Date.now() + schedule[attempts - 1]).toISOString();
   await save(root, state);
   await appendLog(root, 'retry_scheduled', { kind, attempt: attempts, phase: state.phase, nextActionAt: state.nextActionAt });
+}
+
+async function enterRecovery(root, state, kind, retryAfter = null) {
+  state.recovery = scheduleRecovery(state.recovery, kind, state.phase, crypto.randomUUID(), Date.now(),
+    retryAfterTime(retryAfter), state.nextActionAt);
+  state.status = 'running'; state.stopReason = null;
+  state.nextActionAt = state.recovery.nextCheckAt;
+  await save(root, state);
+  await appendLog(root, 'automatic_recovery_wait', { recovery: state.recovery });
+}
+
+async function probeRecovery(root, state) {
+  const r = state.recovery;
+  if (state.intent) throw Error('UNCERTAIN_PREVIOUS_DOWNLOAD');
+  if (Date.now() < Date.parse(r.nextCheckAt)) return;
+  // A restarted in-flight probe reuses its intent files, including click budget.
+  if (r.stage !== 'probing') { r.attempts++; r.stage = 'probing'; await save(root, state); }
+  const result = await ego({ action: 'automaticRecovery', spaceId: state.spaceId,
+    recovery: r, attemptDirectory: path.join(root, 'recovery-attempts') });
+  if (result.kind === 'rate_limit') { await enterRecovery(root, state, 'rate_limit', result.retryAfter); return; }
+  if (result.kind !== 'ready') {
+    r.stage = 'manual_required';
+    await awaitVerification(root, state, { at: new Date().toISOString(), status: result.status, rayId: result.rayId },
+      result.kind === 'login' ? 'BAYT_LOGIN_REQUIRED' : 'AUTOMATIC_VERIFICATION_NEEDS_USER');
+    return;
+  }
+  let page = await ego({ action: 'inspectRaw', spaceId: state.spaceId });
+  if (page.searchId !== state.searchId || page.path !== '/en/employers/cv-search/listing/')
+    page = await ego({ action: 'restoreListing', spaceId: state.spaceId, searchId: state.searchId, page: state.current.page });
+  if (page.warning) throw Error(`BAYT_${page.warning}`);
+  state.phase = resumePhase(state);
+  const nextAt = new Date(Math.max(Date.now(), Date.parse(r.notBefore || '') || 0)).toISOString();
+  if (state.phase === 'next' && freshNextPage(page, state)) await acceptNextPage(root, state, page);
+  else assertListing(page, state, state.current.page, state.current.ids);
+  state.nextActionAt = nextAt; state.recovery = null; state.challenge = null;
+  await save(root, state);
+  await appendLog(root, 'automatic_recovery_succeeded', { attempts: r.attempts, waitedMs: Date.now() - Date.parse(r.startedAt) });
 }
 
 async function verifyCompletedPages(root, state) {
@@ -520,7 +567,7 @@ async function recover(root, userVerified = false) {
   if (!page.warning && page.host === 'www.bayt.com' &&
     (page.path === '/en/employers/cv-search/' || (page.path === '/en/employers/cv-search/listing/' && page.searchId !== state.searchId)))
     page = await ego({ action: 'restoreListing', spaceId: state.spaceId, searchId: state.searchId, page: state.current.page });
-  if (page.warning === 'RATE_LIMIT') throw Error('BAYT_RATE_LIMIT');
+  if (page.warning === 'RATE_LIMIT') { await enterRecovery(root, state, 'rate_limit'); return; }
   if (page.warning === 'LOGIN_REQUIRED') throw Error('BAYT_LOGIN_REQUIRED');
   if (phase === 'next' && !page.warning && freshNextPage(page, state)) {
     const nextAt = state.nextActionAt;
@@ -538,7 +585,7 @@ async function recover(root, userVerified = false) {
     await save(root, state); await appendLog(root, 'checkpoint_resume_verified', { phase }); return;
   }
   if (page.warning === 'RESULTS_HTTP_403' || page.warning === 'CAPTCHA') {
-    await awaitVerification(root, state, challengeEvidence(page), 'VERIFICATION_NOT_CONFIRMED'); return;
+    await enterRecovery(root, state, 'verification'); return;
   }
   throw Error('RECOVERY_PAGE_NOT_VERIFIED');
 }
@@ -558,6 +605,11 @@ async function rebindSupervisor(root, supervisorPid) {
   root = path.resolve(root || '');
   if (!root.startsWith(base + path.sep) || !Number.isInteger(supervisorPid) || supervisorPid < 1) throw Error('QUEUE_REBIND_INVALID');
   const state = JSON.parse(await fsp.readFile(statePath(root), 'utf8'));
+  if (state.status === 'safety_stopped' && automaticRecovery(state.recovery) &&
+    ['LOCAL_LEASE_HEARTBEAT_LOST', 'QUEUE_SUPERVISOR_LOST'].includes(state.stopReason) && !state.intent) {
+    state.phase = resumePhase(state); state.status = 'running'; state.stopReason = null;
+    state.nextActionAt = state.recovery.nextCheckAt;
+  }
   if (state.schemaVersion !== 2 || state.status !== 'running') throw Error('QUEUE_REBIND_NOT_RUNNING');
   await verifyCompletedPages(root, state);
   if (state.intent && !(await reconcileIntent(root, state))) {
@@ -566,6 +618,19 @@ async function rebindSupervisor(root, supervisorPid) {
   state.supervisorPid = supervisorPid;
   await save(root, state);
   await appendLog(root, 'queue_supervisor_rebound', { pid: supervisorPid });
+}
+
+async function verifyRecovery(root) {
+  root = path.resolve(root || '');
+  if (!root.startsWith(base + path.sep)) throw Error('RUN_ROOT_OUTSIDE_LOCAL_RUNS');
+  const state = JSON.parse(await fsp.readFile(statePath(root), 'utf8'));
+  if (state.intent || /UNCERTAIN|RETIRED|MISMATCH|CRC|MAPPING|INVALID/.test(state.stopReason || '')) throw Error('RECOVERY_EVIDENCE_INVALID');
+  await verifyCompletedPages(root, state);
+  if (state.current?.excel && !state.current.pdf) {
+    const file = path.join(batchDir(root, state.current.page), 'resumes.xls');
+    if ((await evidence(file)).sha256 !== state.current.excel.sha256 ||
+      !sameSet((await parseExcelExport(file)).map(row => row.cvId), state.current.ids)) throw Error('PARTIAL_XLS_MISMATCH');
+  }
 }
 
 async function waitUntil(root, state) {
@@ -656,6 +721,7 @@ if (invokedDirectly) {
     else if (command === 'recover') await recover(argument);
     else if (command === 'resume-verified') await recover(argument, true);
     else if (command === 'verify-resume') await verifyResume(argument, String(extra || ''));
+    else if (command === 'verify-recovery') await verifyRecovery(argument);
     else if (command === 'rebind-supervisor') await rebindSupervisor(argument, Number(extra));
     else if (command === 'activate-run') await activateRun(argument, String(extra || ''));
     else if (command === 'retire') await retire(argument);

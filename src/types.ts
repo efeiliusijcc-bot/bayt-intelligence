@@ -339,6 +339,8 @@ export interface CollectorPageCheckpoint {
 }
 
 export interface CollectionQueueJob {
+  recovery?: { id: string; kind: "rate_limit" | "verification"; stage: "waiting" | "probing" | "manual_required";
+    startedAt: string; nextCheckAt: string; attempts: number; rateLimits: number } | null;
   collectedPages?: number;
   collectedCount?: number;
   displayedCount?: number;
