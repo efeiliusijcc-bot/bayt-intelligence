@@ -1,11 +1,17 @@
 import crypto from "node:crypto";
-import type { NextFunction, Request, Response } from "express";
+import type { NextFunction, Request, RequestHandler, Response } from "express";
 import { config } from "./config.ts";
+import { BrowserAuthStore, SESSION_SECONDS, type BrowserSession } from "./browser-auth.ts";
 
-const authenticatedRequests = new WeakSet<Request>();
+const SESSION_COOKIE = "__Host-bayt_session";
+const authenticatedRequests = new WeakMap<Request, BrowserSession>();
 
 export function isAuthenticatedRequest(request: Request): boolean {
   return authenticatedRequests.has(request);
+}
+
+export function authenticatedUser(request: Request): string | null {
+  return authenticatedRequests.get(request)?.user || null;
 }
 
 function safeEqual(left: string, right: string): boolean {
@@ -14,28 +20,69 @@ function safeEqual(left: string, right: string): boolean {
   return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 
-export function basicAuth(request: Request, response: Response, next: NextFunction): void {
-  if (!config.appUser && !config.appPassword && !config.production) {
-    authenticatedRequests.add(request);
+export function sessionToken(request: Request): string | null {
+  const cookie = request.headers.cookie?.split(";").map(part => part.trim())
+    .find(part => part.startsWith(`${SESSION_COOKIE}=`));
+  return cookie ? cookie.slice(SESSION_COOKIE.length + 1) : null;
+}
+
+export function sessionCookie(token: string): string {
+  return `${SESSION_COOKIE}=${token}; Max-Age=${SESSION_SECONDS}; Path=/; Secure; HttpOnly; SameSite=Lax`;
+}
+
+export function clearSessionCookie(): string {
+  return `${SESSION_COOKIE}=; Max-Age=0; Path=/; Secure; HttpOnly; SameSite=Lax`;
+}
+
+export function browserSessionGuard(store: BrowserAuthStore): RequestHandler {
+  return (request, response, next) => {
+    const devWithoutCredentials = !config.production && !config.appUser && !config.appPassword;
+    const session = devWithoutCredentials
+      ? { user: "local-dev", csrfToken: "local-dev-csrf", expiresAt: new Date(Date.now() + SESSION_SECONDS * 1000).toISOString() }
+      : store.get(sessionToken(request));
+    if (!session) {
+      response.status(401).json({ error: { code: "AUTH_REQUIRED", message: "请登录后继续" } });
+      return;
+    }
+    authenticatedRequests.set(request, session);
+    response.setHeader("Cache-Control", "private, no-store");
     next();
+  };
+}
+
+export function currentSession(request: Request): BrowserSession | null {
+  return authenticatedRequests.get(request) || null;
+}
+
+export function requireSameOrigin(request: Request, response: Response, next: NextFunction): void {
+  const origin = request.headers.origin;
+  if (!origin || (origin !== config.appPublicOrigin && origin !== config.appLegacyPublicOrigin)) {
+    response.status(403).json({ error: { code: "ORIGIN_REQUIRED", message: "仅接受本站发起的登录和变更请求" } });
     return;
   }
-  const header = request.headers.authorization || "";
-  if (header.startsWith("Basic ")) {
-    const decoded = Buffer.from(header.slice(6), "base64").toString("utf8");
-    const separator = decoded.indexOf(":");
-    if (separator > 0) {
-      const user = decoded.slice(0, separator);
-      const password = decoded.slice(separator + 1);
-      if (safeEqual(user, config.appUser) && safeEqual(password, config.appPassword)) {
-        authenticatedRequests.add(request);
-        next();
-        return;
-      }
-    }
+  next();
+}
+
+export function requireLoginCsrf(request: Request, response: Response, next: NextFunction): void {
+  // Before authentication there is no session-bound token. A custom header
+  // plus strict Origin validation prevents a cross-site form login request.
+  if (request.headers["x-csrf-token"] !== "login-init") {
+    response.status(403).json({ error: { code: "CSRF_INVALID", message: "请从本站登录页面提交" } });
+    return;
   }
-  response.setHeader("WWW-Authenticate", 'Basic realm="Bayt Intelligence", charset="UTF-8"');
-  response.status(401).json({ error: { code: "AUTH_REQUIRED", message: "需要登录后访问人物库" } });
+  next();
+}
+
+export function requireSessionCsrf(request: Request, response: Response, next: NextFunction): void {
+  if (["GET", "HEAD", "OPTIONS"].includes(request.method)) { next(); return; }
+  if (!config.production && !config.appUser && !config.appPassword) { next(); return; }
+  const session = currentSession(request);
+  const supplied = String(request.headers["x-csrf-token"] || "");
+  if (!session || !supplied || !safeEqual(supplied, session.csrfToken)) {
+    response.status(403).json({ error: { code: "CSRF_INVALID", message: "页面安全凭据已失效，请刷新后重试" } });
+    return;
+  }
+  requireSameOrigin(request, response, next);
 }
 
 export function securityHeaders(_request: Request, response: Response, next: NextFunction): void {

@@ -80,7 +80,7 @@ async function challenge() {
   const state = await page.evaluate(browserState);
   if (state.host === 'www.bayt.com' && state.path === '/en/employers/cv-search/listing/' &&
     !state.warning && state.searchId === cfg.searchId && state.keyword === cfg.keyword &&
-    Object.values(state.filters).every(Boolean) && state.ids.length > 0) return { cleared: true, state, clicked: visibleButton >= 0 };
+    (cfg.schemaVersion === 2 || Object.values(state.filters).every(Boolean)) && state.ids.length > 0) return { cleared: true, state, clicked: visibleButton >= 0 };
   return { cleared: false, state, clicked: visibleButton >= 0 };
 }
 
@@ -90,7 +90,7 @@ function assertIdentity(state) {
   if (state.page !== cfg.page) throw Error('PAGE_NUMBER_CHANGED');
   if (!state.ids.length || state.ids.length > 50 || new Set(state.ids).size !== state.ids.length)
     throw Error('PAGE_CV_ID_INVALID');
-  if (!Object.values(state.filters).every(Boolean)) throw Error('FILTER_CHANGED');
+  if (cfg.schemaVersion !== 2 && !Object.values(state.filters).every(Boolean)) throw Error('FILTER_CHANGED');
   if (cfg.ids && (state.ids.length !== cfg.ids.length || state.ids.some((id, index) => id !== cfg.ids[index])))
     throw Error('PAGE_MEMBERS_CHANGED');
 }
@@ -184,7 +184,7 @@ async function confirm(format) {
 
 async function nextPage() {
   const state = await inspect();
-  if (state.searchId !== cfg.searchId || state.keyword !== cfg.keyword || !Object.values(state.filters).every(Boolean))
+  if (state.searchId !== cfg.searchId || state.keyword !== cfg.keyword || (cfg.schemaVersion !== 2 && !Object.values(state.filters).every(Boolean)))
     throw Error('SEARCH_IDENTITY_CHANGED');
   if (state.page === cfg.page + 1) {
     if (state.ids.some(id => cfg.ids.includes(id))) throw Error('NEXT_PAGE_OVERLAP');
@@ -206,7 +206,7 @@ async function nextPage() {
   }, { page: cfg.page, ids: cfg.ids }, { timeout: 45_000 });
   const after = await inspect();
   if (after.page !== cfg.page + 1 || after.ids.some(id => cfg.ids.includes(id)) ||
-    after.searchId !== cfg.searchId || after.keyword !== cfg.keyword || !Object.values(after.filters).every(Boolean))
+    after.searchId !== cfg.searchId || after.keyword !== cfg.keyword || (cfg.schemaVersion !== 2 && !Object.values(after.filters).every(Boolean)))
     throw Error('NEXT_PAGE_VALIDATION_FAILED');
   return after;
 }

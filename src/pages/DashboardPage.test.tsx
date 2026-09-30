@@ -106,7 +106,7 @@ test("筛选条件同步URL且重置一次清空全部条件", async () => {
   await screen.findByRole("heading", { name: "人员总体画像" });
   fireEvent.change(screen.getByRole("combobox", { name: "国家/地区" }), { target: { value: "India" } });
   await waitFor(() => expect(screen.getByTestId("location-search")).toHaveTextContent("country=India"));
-  await waitFor(() => expect(fetchMock).toHaveBeenLastCalledWith(expect.stringContaining("country=India"), undefined));
+  await waitFor(() => expect(fetchMock).toHaveBeenLastCalledWith(expect.stringContaining("country=India"), expect.objectContaining({ credentials: "same-origin" })));
   fireEvent.click(screen.getByRole("button", { name: "重置筛选" }));
   await waitFor(() => expect(screen.getByTestId("location-search")).toHaveTextContent(/^$/));
   rendered.unmount();

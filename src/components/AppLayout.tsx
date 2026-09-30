@@ -13,6 +13,7 @@ import {
 } from "@fluentui/react-icons";
 import { Button, Input, Tooltip } from "@fluentui/react-components";
 import { NavLink, Outlet, useLocation, useNavigate } from "react-router-dom";
+import { useAuth } from "../auth";
 
 const navItems = [
   { to: "/dashboard", label: "总览", icon: Home24Regular },
@@ -34,6 +35,8 @@ const pageNames: Record<string, string> = {
 export function AppLayout() {
   const [collapsed, setCollapsed] = useState(false);
   const [globalSearch, setGlobalSearch] = useState("");
+  const [logoutError, setLogoutError] = useState("");
+  const { session, logout } = useAuth();
   const navigate = useNavigate();
   const location = useLocation();
   const rootPath = location.pathname.split("/")[1] || "dashboard";
@@ -75,8 +78,14 @@ export function AppLayout() {
         <div className="sidebar-footer">
           <div className="user-block">
             <PersonCircle24Regular aria-hidden="true" />
-            {!collapsed && <div><strong>本地管理员</strong><span>只读数据访问</span></div>}
+            {!collapsed && <div><strong>{session?.user || "本站用户"}</strong><span>已登录 · 7 天会话</span></div>}
           </div>
+          {!collapsed && <Button appearance="subtle" className="logout-button" onClick={async () => {
+            setLogoutError("");
+            try { await logout(); navigate("/login", { replace: true }); }
+            catch { setLogoutError("退出失败，请重试"); }
+          }}>退出登录</Button>}
+          {logoutError && !collapsed && <span className="logout-error" role="alert">{logoutError}</span>}
           <Tooltip content={collapsed ? "展开导航" : "收起导航"} relationship="label">
             <Button
               appearance="subtle"

@@ -125,7 +125,7 @@ async function ego(action) {
 function assertListing(page, state, expectedPage, expectedIds) {
   if (page.host !== 'www.bayt.com' || page.path !== '/en/employers/cv-search/listing/' ||
     page.searchId !== state.searchId || page.keyword !== state.keyword || page.page !== expectedPage ||
-    !Object.values(page.filters || {}).every(Boolean) || !page.ids.length || page.ids.length > 50 ||
+    (state.schemaVersion !== 2 && !Object.values(page.filters || {}).every(Boolean)) || !page.ids.length || page.ids.length > 50 ||
     new Set(page.ids).size !== page.ids.length ||
     (expectedIds && !sameSet(page.ids, expectedIds))) throw Error('LISTING_IDENTITY_OR_FILTER_MISMATCH');
 }
@@ -187,7 +187,7 @@ async function handleChallenge(root, state, raw, message = '') {
   await save(root, state);
   let result;
   try {
-    result = await ego({ action: 'challenge', spaceId: state.spaceId, searchId: state.searchId, keyword: state.keyword });
+    result = await ego({ action: 'challenge', spaceId: state.spaceId, searchId: state.searchId, keyword: state.keyword, schemaVersion: state.schemaVersion });
   } catch (error) {
     await appendLog(root, 'challenge_normal_load_failed', { code: String(error?.message || error).slice(0, 120) });
     await awaitVerification(root, state, evidence, 'BAYT_CHALLENGE_NOT_VISIBLE');
@@ -231,6 +231,43 @@ async function init(spaceId) {
   console.log(root);
 }
 
+async function initJob(input) {
+  const { spaceId, job, supervisorPid, actualKeyword } = input;
+  if (!Number.isInteger(spaceId) || spaceId < 1 || job?.searchSpec?.schemaVersion !== 2 ||
+    !Number.isInteger(supervisorPid) || supervisorPid < 1) throw Error('INVALID_QUEUE_JOB_INIT');
+  const page = await ego({ action: 'inspect', spaceId });
+  const baseline = { schemaVersion: 2, searchId: page.searchId, keyword: actualKeyword };
+  assertListing(page, baseline, 1);
+  const runId = `local-ego-${new Date().toISOString().replace(/[:.]/g, '-')}-${crypto.randomBytes(3).toString('hex')}`;
+  await fsp.mkdir(base, { recursive: true, mode: 0o700 });
+  const root = path.join(base, runId);
+  await fsp.mkdir(root, { mode: 0o700 });
+  const startedAt = new Date();
+  const deadlineMs = job.limits.durationHours ? job.limits.durationHours * HOUR : 48 * HOUR;
+  const state = { schemaVersion: 2, runId, spaceId, queueJobId: job.id, supervisorPid,
+    keyword: baseline.keyword, searchId: baseline.searchId, searchSpec: job.searchSpec, limits: job.limits,
+    startedAt: startedAt.toISOString(), deadlineAt: new Date(startedAt.getTime() + deadlineMs).toISOString(),
+    status: 'prepared', phase: 'excel_prepare', nextActionAt: startedAt.toISOString(),
+    current: { page: 1, ids: page.ids, firstSeenAt: startedAt.toISOString(), excel: null, pdf: null },
+    pages: [], seenIds: [], intent: null, failures: 0, rateLimits: 0, stopReason: null };
+  await save(root, state);
+  await appendLog(root, 'queue_job_initialized', { jobId: job.id, searchId: state.searchId, page: 1, candidates: page.ids.length });
+  console.log(root);
+}
+
+async function activateRun(root, jobId) {
+  root = path.resolve(root || '');
+  if (!root.startsWith(base + path.sep)) throw Error('RUN_ROOT_OUTSIDE_LOCAL_RUNS');
+  const state = JSON.parse(await fsp.readFile(statePath(root), 'utf8'));
+  if (state.schemaVersion !== 2 || state.queueJobId !== jobId || state.pages.length || state.intent ||
+    !['prepared', 'running'].includes(state.status)) throw Error('QUEUE_RUN_ACTIVATION_INVALID');
+  if (state.status === 'prepared') {
+    state.status = 'running';
+    await save(root, state);
+    await appendLog(root, 'queue_run_activated', { jobId });
+  }
+}
+
 async function commitExcel(root, state) {
   const file = path.join(batchDir(root, state.current.page), 'resumes.xls');
   const rows = await parseExcelExport(file);
@@ -247,7 +284,7 @@ async function commitExcel(root, state) {
 async function commitPdf(root, state) {
   const dir = batchDir(root, state.current.page);
   const manifest = await verifyBulkBatch({
-    runId: state.runId, keyword: state.keyword, page: state.current.page,
+    runId: state.runId, queueJobId: state.queueJobId, keyword: state.keyword, page: state.current.page,
     expectedCvIds: state.current.ids,
     excelPath: path.join(dir, 'resumes.xls'), pdfArchivePath: path.join(dir, 'resumes.zip'),
   });
@@ -286,6 +323,13 @@ async function reconcileIntent(root, state) {
 
 async function step(root, state) {
   const current = state.current;
+  if (state.phase === 'next' && state.limits &&
+    ((state.limits.maxPages && state.pages.length >= state.limits.maxPages) ||
+      (state.limits.targetCount && state.seenIds.length >= state.limits.targetCount))) {
+    state.status = 'completed'; state.phase = 'finished'; state.nextActionAt = null;
+    await save(root, state); await appendLog(root, 'queue_job_limits_reached', { pages: state.pages.length, count: state.seenIds.length });
+    return;
+  }
   // Do not start a fresh page once the 24-hour window has elapsed. An XLS
   // already started before the deadline may still receive its matching PDF.
   if (state.phase === 'excel_prepare' && deadlineReached(state.deadlineAt)) {
@@ -294,7 +338,7 @@ async function step(root, state) {
     await appendLog(root, 'duration_completed', { total: state.seenIds.length });
     return;
   }
-  const common = { spaceId: state.spaceId, searchId: state.searchId, keyword: state.keyword,
+  const common = { spaceId: state.spaceId, searchId: state.searchId, keyword: state.keyword, schemaVersion: state.schemaVersion,
     page: current.page, ids: current.ids };
   if (state.phase === 'excel_prepare' || state.phase === 'pdf_prepare') {
     const format = state.phase.startsWith('excel') ? 'xls' : 'pdf';
@@ -384,14 +428,41 @@ async function verifyCompletedPages(root, state) {
     if (ids.some(id => seen.has(id))) throw Error('CHECKPOINT_CV_ID_OVERLAP');
     ids.forEach(id => seen.add(id));
     const checked = await verifyBulkBatch({ runId: state.runId, keyword: state.keyword, page: item.page,
+      queueJobId: state.queueJobId,
       expectedCvIds: ids, excelPath: path.join(dir, 'resumes.xls'), pdfArchivePath: path.join(dir, 'resumes.zip') });
     const stored = JSON.parse(await fsp.readFile(path.join(dir, 'manifest.json'), 'utf8'));
     if (checked.cvIdSetSha256 !== item.cvIdSetSha256 || stored.cvIdSetSha256 !== checked.cvIdSetSha256 ||
+      stored.schemaVersion !== checked.schemaVersion || stored.queueJobId !== checked.queueJobId ||
       stored.files?.excel?.sha256 !== checked.files.excel.sha256 ||
       stored.files?.pdfArchive?.sha256 !== checked.files.pdfArchive.sha256 || item.count !== ids.length)
       throw Error('CHECKPOINT_PAGE_EVIDENCE_MISMATCH');
   }
   if (seen.size !== state.seenIds.length || state.seenIds.some(id => !seen.has(id))) throw Error('CHECKPOINT_SEEN_IDS_MISMATCH');
+}
+
+async function retire(root) {
+  root = path.resolve(root || '');
+  if (!root.startsWith(base + path.sep)) throw Error('RUN_ROOT_OUTSIDE_LOCAL_RUNS');
+  const state = JSON.parse(await fsp.readFile(statePath(root), 'utf8'));
+  if (!['awaiting_verification', 'safety_stopped', 'completed'].includes(state.status))
+    throw Error('RUN_NOT_RETIRABLE');
+  if (state.intent) throw Error('UNCERTAIN_PREVIOUS_DOWNLOAD');
+  await verifyCompletedPages(root, state);
+  for (const page of state.pages) {
+    const receipt = JSON.parse(await fsp.readFile(path.join(root, 'upload-receipts', `${String(page.page).padStart(4, '0')}.json`), 'utf8'));
+    const manifestPath = path.join(batchDir(root, page.page), 'manifest.json');
+    if (receipt.status !== 'uploaded' || receipt.page !== page.page ||
+      receipt.manifestSha256 !== await sha256File(manifestPath) ||
+      receipt.excelSha256 !== page.manifest.files.excel.sha256 ||
+      receipt.pdfSha256 !== page.manifest.files.pdfArchive.sha256)
+      throw Error('RUN_UPLOAD_EVIDENCE_MISMATCH');
+  }
+  state.status = 'operator_stopped';
+  state.phase = 'stopped';
+  state.stopReason = 'RETIRED_BY_ADMIN_NEW_COLLECTION';
+  state.nextActionAt = null;
+  await save(root, state);
+  await appendLog(root, 'run_retired_by_admin', { pages: state.pages.length, verifiedResumes: state.seenIds.length });
 }
 
 async function recover(root, userVerified = false) {
@@ -424,8 +495,26 @@ async function recover(root, userVerified = false) {
   throw Error('RECOVERY_PAGE_NOT_VERIFIED');
 }
 
+async function rebindSupervisor(root, supervisorPid) {
+  root = path.resolve(root || '');
+  if (!root.startsWith(base + path.sep) || !Number.isInteger(supervisorPid) || supervisorPid < 1) throw Error('QUEUE_REBIND_INVALID');
+  const state = JSON.parse(await fsp.readFile(statePath(root), 'utf8'));
+  if (state.schemaVersion !== 2 || state.status !== 'running') throw Error('QUEUE_REBIND_NOT_RUNNING');
+  await verifyCompletedPages(root, state);
+  if (state.intent && !(await reconcileIntent(root, state))) {
+    await stop(root, state, 'UNCERTAIN_PREVIOUS_DOWNLOAD'); throw Error('UNCERTAIN_PREVIOUS_DOWNLOAD');
+  }
+  state.supervisorPid = supervisorPid;
+  await save(root, state);
+  await appendLog(root, 'queue_supervisor_rebound', { pid: supervisorPid });
+}
+
 async function waitUntil(root, state) {
   while (!shutdownRequested && state.status === 'running' && Date.now() < Date.parse(state.nextActionAt)) {
+    if (state.supervisorPid) {
+      try { process.kill(state.supervisorPid, 0); }
+      catch { await stop(root, state, 'QUEUE_SUPERVISOR_LOST'); return; }
+    }
     if (fs.existsSync(path.join(root, 'stop-requested.json'))) {
       state.status = 'operator_stopped'; state.phase = 'stopped'; state.stopReason = 'LOCAL_STOP_REQUESTED';
       await save(root, state); return;
@@ -454,6 +543,10 @@ async function run(root) {
     await handle.writeFile(JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() }));
     const state = JSON.parse(await fsp.readFile(statePath(root), 'utf8'));
     if (state.status !== 'running') return;
+    if (state.schemaVersion === 2) {
+      try { await verifyCompletedPages(root, state); }
+      catch { await stop(root, state, 'CHECKPOINT_PAGE_EVIDENCE_MISMATCH'); return; }
+    }
     if (state.intent && !(await reconcileIntent(root, state))) {
       await stop(root, state, 'UNCERTAIN_PREVIOUS_DOWNLOAD'); return;
     }
@@ -461,6 +554,10 @@ async function run(root) {
       await waitUntil(root, state);
       if (shutdownRequested) break;
       if (state.status !== 'running') break;
+      if (state.supervisorPid) {
+        try { process.kill(state.supervisorPid, 0); }
+        catch { await stop(root, state, 'QUEUE_SUPERVISOR_LOST'); break; }
+      }
       try { await step(root, state); }
       catch (error) { await handleError(root, state, error); }
     }
@@ -472,12 +569,16 @@ async function run(root) {
 
 const invokedDirectly = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
 if (invokedDirectly) {
-  const [command, argument] = process.argv.slice(2);
+  const [command, argument, extra] = process.argv.slice(2);
   try {
     if (command === 'init') await init(Number(argument));
+    else if (command === 'init-job') await initJob(JSON.parse(await fsp.readFile(path.resolve(argument || ''), 'utf8')));
     else if (command === 'run') await run(argument);
     else if (command === 'recover') await recover(argument);
     else if (command === 'resume-verified') await recover(argument, true);
+    else if (command === 'rebind-supervisor') await rebindSupervisor(argument, Number(extra));
+    else if (command === 'activate-run') await activateRun(argument, String(extra || ''));
+    else if (command === 'retire') await retire(argument);
     else if (command === 'status') console.log(await fsp.readFile(statusPath(path.resolve(argument || '')), 'utf8'));
     else throw Error('Usage: local-ego-soak.mjs init <space-id> | run <run-root> | status <run-root>');
   } catch (error) {

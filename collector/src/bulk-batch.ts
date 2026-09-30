@@ -11,8 +11,9 @@ import { sha256File, writeJsonAtomic } from "./files.ts";
 
 /** 一页验收清单的固定结构，最终会序列化为manifest.json。 */
 export interface BulkBatchManifest {
-  schemaVersion: 1;
+  schemaVersion: 1 | 2;
   runId: string;
+  queueJobId?: string;
   keyword: string;
   page: number;
   createdAt: string;
@@ -154,6 +155,7 @@ async function fileEvidence(filePath: string): Promise<FileEvidence> {
  */
 export async function verifyBulkBatch(input: {
   runId: string;
+  queueJobId?: string;
   keyword: string;
   page: number;
   expectedCvIds: string[];
@@ -197,8 +199,9 @@ export async function verifyBulkBatch(input: {
     throw new Error("Bulk export CV_ID set hashes do not match");
   }
   return {
-    schemaVersion: 1,
+    schemaVersion: input.queueJobId ? 2 : 1,
     runId: input.runId,
+    ...(input.queueJobId ? { queueJobId: input.queueJobId } : {}),
     keyword: input.keyword,
     page: input.page,
     createdAt: new Date().toISOString(),

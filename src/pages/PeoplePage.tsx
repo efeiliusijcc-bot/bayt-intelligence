@@ -12,6 +12,7 @@ import {
 import { Link, useSearchParams } from "react-router-dom";
 import { apiClient, displayText } from "../api";
 import { EmptyState, ErrorState, LoadingState } from "../components/PageStates";
+import { CollectionSourceLinks } from "../components/CollectionSourceLinks";
 import type { PersonView } from "../types";
 
 export function PeoplePage() {
@@ -124,6 +125,7 @@ export function PersonCard({ person }: { person: PersonView }) {
         <div className="person-title"><Link to={`/people/${person.cvId}`}>{displayText(person.displayName)}</Link><span>{displayText(person.headline)}</span><small>{[person.nationality, person.residence].filter(Boolean).map((value) => displayText(value)).join(" / ") || "所在地未提供"}</small></div>
       </div>
       <div className="person-meta"><span>Bayt CV ID</span><strong>{person.cvId}</strong><span>简历更新</span><strong>{person.lastCvUpdate || "未提供"}</strong></div>
+      <div className="person-collection-source"><span>采集任务</span><CollectionSourceLinks person={person} /></div>
       <div className="skill-tags">
         {person.topSkills.slice(0, 5).map((skill) => <Badge key={skill.name} appearance="tint" color="informative">{displayText(skill.name)}</Badge>)}
         {person.skills.length > 5 && <span className="more-skills">+{person.skills.length - 5}</span>}
@@ -146,13 +148,14 @@ function PeopleTable({ people }: { people: PersonView[] }) {
   return (
     <div className="data-table-wrap">
       <table className="data-table people-table">
-        <thead><tr><th>人物</th><th>CV_ID</th><th>当前职位</th><th>所在地</th><th>职业分</th><th>研究分</th><th>Bayt PDF</th><th>更新时间</th><th>操作</th></tr></thead>
+        <thead><tr><th>人物</th><th>CV_ID</th><th>当前职位</th><th>所在地</th><th>来源任务</th><th>职业分</th><th>研究分</th><th>Bayt PDF</th><th>更新时间</th><th>操作</th></tr></thead>
         <tbody>{people.map((person) => (
           <tr key={person.cvId}>
             <td><div className="table-person"><PersonAvatar person={person} /><strong>{displayText(person.displayName)}</strong></div></td>
             <td className="mono">{person.cvId}</td>
             <td>{displayText(person.headline)}</td>
             <td>{displayText(person.residence)}</td>
+            <td><CollectionSourceLinks person={person} /></td>
             <td>{person.professionalScore === null ? "未评分" : `${person.professionalScore} / 100`}</td><td>{researchScoreLabel(person)}</td>
             <td>{person.attachments.some((item) => item.kind === "bayt_pdf" && item.status === "downloaded") ? "已绑定" : "缺失"}</td>
             <td>{person.lastCvUpdate || "未提供"}</td>

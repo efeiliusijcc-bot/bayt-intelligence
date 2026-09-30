@@ -11,17 +11,19 @@ import {
   Info24Regular,
   Open24Regular,
 } from "@fluentui/react-icons";
-import { Link, useParams } from "react-router-dom";
+import { Link, useParams, useSearchParams } from "react-router-dom";
 import { ApiError, apiClient, displayText, formatBytes } from "../api";
 import { ErrorState, LoadingState } from "../components/PageStates";
 import { SourceBadge } from "../components/SourceBadge";
+import { CollectionSourceLinks } from "../components/CollectionSourceLinks";
 import type { AttachmentView, PersonView, ResearchCaseDetail, ResearchCaseStatus } from "../types";
 
 type DetailTab = "overview" | "experience" | "skills" | "attachments" | "scoring" | "research" | "audit";
 
 export function PersonDetailPage() {
   const { cvId = "" } = useParams();
-  const [tab, setTab] = useState<DetailTab>("overview");
+  const [params] = useSearchParams();
+  const [tab, setTab] = useState<DetailTab>(params.get("tab") === "attachments" ? "attachments" : "overview");
   const person = useQuery({ queryKey: ["person", cvId], queryFn: () => apiClient.person(cvId), enabled: Boolean(cvId) });
   if (person.isLoading) return <LoadingState label="正在加载人物详情" />;
   if (person.isError || !person.data) return <ErrorState message={person.error?.message || "人物资料不可用"} retry={() => person.refetch()} />;
@@ -32,6 +34,7 @@ export function PersonDetailPage() {
       <section className="person-detail-header">
         <DetailAvatar person={data} />
         <div className="detail-identity"><h1>{displayText(data.displayName)}</h1><p>{displayText(data.headline)} / {displayText(data.residence)}</p><div className="header-badges"><Badge appearance="outline">CV_ID {data.cvId}</Badge><Badge appearance="outline">更新 {data.lastCvUpdate || "未提供"}</Badge>{data.sourceTags.map((source) => <SourceBadge key={source} source={source} />)}</div></div>
+        <div className="detail-collection-source"><span>来源任务</span><CollectionSourceLinks person={data} /></div>
         <div className="header-scores"><div><span>职业匹配</span><strong>{data.professionalScore === null ? "未评分" : `${data.professionalScore} / 100`}</strong></div><div><span>研究优先级</span><strong>{data.researchPriorityScore === null ? (data.professionalScore === null ? "未评分" : "未达门槛") : `${data.researchPriorityScore} / 100`}</strong></div></div>
       </section>
       <section className="detail-tabs-panel">

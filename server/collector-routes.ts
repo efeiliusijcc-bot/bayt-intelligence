@@ -13,7 +13,7 @@ function timingSafeBearer(suppliedHeader: string | undefined, expectedToken: str
 function agentAuth(expectedToken: string): RequestHandler {
   return (request, response, next) => {
     if (!timingSafeBearer(request.headers.authorization, expectedToken)) {
-      response.status(401).json({ error: { code: "COLLECTOR_AGENT_UNAUTHORIZED", message: "Windows Agent认证失败" } });
+      response.status(401).json({ error: { code: "COLLECTOR_AGENT_UNAUTHORIZED", message: "采集Agent认证失败" } });
       return;
     }
     next();
@@ -73,6 +73,13 @@ export function createCollectorAgentRouter(store: CollectorControlStore, token: 
     }
   });
 
+  router.post("/jobs/:id/runs", (request, response, next) => {
+    try {
+      store.registerRun(String(request.params.id), bodyAgentId(request), leaseToken(request), request.body?.runId, request.body?.searchId);
+      response.sendStatus(204);
+    } catch (error) { next(error); }
+  });
+
   router.post("/jobs/:id/heartbeat", (request, response, next) => {
     try {
       response.json(store.heartbeatJob(request.params.id, bodyAgentId(request), leaseToken(request), request.body?.evidence || {}));
@@ -83,7 +90,7 @@ export function createCollectorAgentRouter(store: CollectorControlStore, token: 
 
   router.post("/jobs/:id/checkpoints", async (request, response, next) => {
     try {
-      await verifyIncomingBatch(request.body || {}, incoming.localRoot, incoming.remoteRoot);
+      await verifyIncomingBatch(request.body || {}, incoming.localRoot, incoming.remoteRoot, String(request.params.id));
       response.status(201).json(store.checkpointPage(request.params.id, bodyAgentId(request), leaseToken(request), request.body || {}));
     } catch (error) {
       next(error);
@@ -133,6 +140,14 @@ export function createCollectorControlRouter(
     } catch (error) {
       next(error);
     }
+  });
+
+  router.post("/control/acknowledge-safety", requireBrowserMutation, (request, response, next) => {
+    try {
+      const result = store.acknowledgeGlobalPause(request.body?.reason);
+      record(request, "COLLECTOR_GLOBAL_PAUSE_ACKNOWLEDGED", String(request.body?.reason || "").slice(0, 500));
+      response.json(result);
+    } catch (error) { next(error); }
   });
 
   router.get("/search-templates", (_request, response) => response.json({ items: store.listTemplates() }));

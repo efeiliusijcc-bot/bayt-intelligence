@@ -73,6 +73,7 @@ export interface PersonView {
     | "FAILED";
   sourceTags: SourceType[];
   importedAt: string | null;
+  collectionTasks?: Array<{ id: string; name: string; page: number; importedAt: string }>;
 }
 
 export interface StoredAttachment extends AttachmentView {

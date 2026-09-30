@@ -1,6 +1,7 @@
 import type {
   CollectorRun,
   CollectionQueueJob,
+  CollectorJobPeopleResponse,
   CollectorAgentState,
   CollectorControlState,
   CollectorFilterCatalog,
@@ -35,11 +36,24 @@ export class ApiError extends Error {
   }
 }
 
+export interface AuthSession { user: string; csrfToken: string; expiresAt: string }
+
+let csrfToken: string | null = null;
+
 async function api<T>(url: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(url, init);
+  const headers = new Headers(init?.headers);
+  const method = (init?.method || "GET").toUpperCase();
+  if (!["GET", "HEAD", "OPTIONS"].includes(method) && !url.endsWith("/auth/login") && csrfToken) {
+    headers.set("X-CSRF-Token", csrfToken);
+  }
+  const response = await fetch(url, { ...init, headers, credentials: "same-origin" });
   const contentType = response.headers.get("content-type") || "";
   const body = contentType.includes("application/json") ? ((await response.json()) as ApiErrorBody & T) : null;
   if (!response.ok) {
+    if (response.status === 401 && !url.endsWith("/auth/login")) {
+      csrfToken = null;
+      window.dispatchEvent(new Event("bayt-auth-expired"));
+    }
     throw new ApiError(body?.error?.message || "系统暂时无法完成该请求", body?.error?.code, response.status);
   }
   return body as T;
@@ -53,6 +67,15 @@ function collectorMutationInit(init: RequestInit = {}): RequestInit {
 }
 
 export const apiClient = {
+  authMe: async () => { const session = await api<AuthSession>("/api/v1/auth/me"); csrfToken = session.csrfToken; return session; },
+  authLogin: async (user: string, password: string) => {
+    const session = await api<AuthSession>("/api/v1/auth/login", {
+      method: "POST", headers: { "Content-Type": "application/json", "X-CSRF-Token": "login-init" }, body: JSON.stringify({ user, password }),
+    });
+    csrfToken = session.csrfToken;
+    return session;
+  },
+  authLogout: async () => { await api<void>("/api/v1/auth/logout", { method: "POST" }); csrfToken = null; },
   dashboard: () => api<DashboardData>("/api/v1/dashboard"),
   dashboardAnalytics: (search: URLSearchParams) => api<DashboardAnalyticsData>(`/api/v1/dashboard/analytics?${search.toString()}`),
   people: (search: URLSearchParams) => api<PeopleResponse>(`/api/v1/people?${search.toString()}`),
@@ -86,7 +109,10 @@ export const apiClient = {
   copyCollectorSearchTemplate: (id: string) => api<CollectorSearchTemplate>(`/api/v1/collector/search-templates/${encodeURIComponent(id)}/copy`, collectorMutationInit({ method: "POST", body: "{}" })),
   deleteCollectorSearchTemplate: (id: string) => api<void>(`/api/v1/collector/search-templates/${encodeURIComponent(id)}`, collectorMutationInit({ method: "DELETE" })),
   collectorQueue: () => api<{ items: CollectionQueueJob[]; control: CollectorControlState; agents: CollectorAgentState[] }>("/api/v1/collector/jobs"),
-  createCollectionJob: (input: { templateId?: string; name?: string; searchSpec?: CollectorSearchSpec; limits: CollectorLimits }) => api<CollectionQueueJob>("/api/v1/collector/jobs", collectorMutationInit({ method: "POST", body: JSON.stringify(input) })),
+  collectorJob: (id: string) => api<CollectionQueueJob>(`/api/v1/collector/jobs/${encodeURIComponent(id)}`),
+  collectorJobPeople: (id: string, page: number) => api<CollectorJobPeopleResponse>(`/api/v1/collector/jobs/${encodeURIComponent(id)}/people?page=${page}&pageSize=12`),
+  createCollectionJob: (input: { templateId?: string; name?: string; searchSpec?: CollectorSearchSpec; limits: CollectorLimits; clientRequestId?: string }) => api<CollectionQueueJob>("/api/v1/collector/jobs", collectorMutationInit({ method: "POST", body: JSON.stringify(input) })),
+  acknowledgeCollectorSafety: (reason: string) => api<CollectorControlState>("/api/v1/collector/control/acknowledge-safety", collectorMutationInit({ method: "POST", body: JSON.stringify({ reason }) })),
   updateCollectionJobLimits: (id: string, limits: CollectorLimits) => api<CollectionQueueJob>(`/api/v1/collector/jobs/${encodeURIComponent(id)}/limits`, collectorMutationInit({ method: "PATCH", body: JSON.stringify(limits) })),
   collectorJobAction: (id: string, action: "pause" | "resume" | "cancel" | "move-up" | "move-down") => api<CollectionQueueJob>(`/api/v1/collector/jobs/${encodeURIComponent(id)}/${action}`, collectorMutationInit({ method: "POST", body: "{}" })),
   collectorSchedules: () => api<{ items: CollectorSchedule[] }>("/api/v1/collector/schedules"),

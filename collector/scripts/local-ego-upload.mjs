@@ -38,7 +38,8 @@ async function writeJson(file, value) {
 }
 
 export function assertPageEvidence(saved, checked, statePage) {
-  if (saved.runId !== checked.runId || saved.page !== checked.page || saved.page !== statePage.page ||
+  if (saved.runId !== checked.runId || saved.schemaVersion !== checked.schemaVersion || saved.queueJobId !== checked.queueJobId ||
+      saved.page !== checked.page || saved.page !== statePage.page ||
       saved.selectedCount !== checked.selectedCount || saved.cvIdSetSha256 !== checked.cvIdSetSha256 ||
       saved.files?.excel?.sha256 !== checked.files.excel.sha256 ||
       saved.files?.pdfArchive?.sha256 !== checked.files.pdfArchive.sha256 ||
@@ -73,7 +74,7 @@ async function publish(root, state, page) {
   const manifestPath = path.join(dir, 'manifest.json');
   const saved = JSON.parse(await fsp.readFile(manifestPath, 'utf8'));
   const ids = (await (await import('../src/excel.ts')).parseExcelExport(path.join(dir, 'resumes.xls'))).map(row => row.cvId);
-  const checked = await verifyBulkBatch({ runId: state.runId, keyword: state.keyword, page: page.page,
+  const checked = await verifyBulkBatch({ runId: state.runId, queueJobId: state.queueJobId, keyword: state.keyword, page: page.page,
     expectedCvIds: ids, excelPath: path.join(dir, 'resumes.xls'), pdfArchivePath: path.join(dir, 'resumes.zip') });
   assertPageEvidence(saved, checked, page);
   const manifestHash = await sha256File(manifestPath);

@@ -47,7 +47,7 @@ function verifyZipCrc(filePath: string): Promise<number> {
   }));
 }
 
-export async function verifyIncomingBatch(input: Record<string, unknown>, localRoot: string, remoteRoot: string): Promise<void> {
+export async function verifyIncomingBatch(input: Record<string, unknown>, localRoot: string, remoteRoot: string, expectedJobId?: string): Promise<void> {
   const remoteBatch = String(input.remoteBatch || "");
   const normalizedRemoteRoot = remoteRoot.replace(/\/$/, "");
   if (!remoteBatch.startsWith(`${normalizedRemoteRoot}/`) || remoteBatch.includes("..")) throw new Error("远端批次路径不在允许目录内");
@@ -67,6 +67,13 @@ export async function verifyIncomingBatch(input: Record<string, unknown>, localR
   const [excelHash, pdfHash, manifestText] = await Promise.all([sha256File(excelPath), sha256File(pdfPath), fsp.readFile(manifestPath, "utf8")]);
   if (excelHash !== input.excelSha256 || pdfHash !== input.pdfSha256) throw new Error("服务端落盘文件SHA-256与Agent检查点不一致");
   const manifest = JSON.parse(manifestText) as Record<string, unknown>;
+  if (expectedJobId) {
+    const [runId, batchName] = relative.split("/");
+    if (relative.split("/").length !== 2 || manifest.runId !== runId || batchName !== `batch-${String(input.page).padStart(4, "0")}`)
+      throw new Error("manifest运行ID与批次路径不一致");
+  }
+  if (expectedJobId && (manifest.schemaVersion !== 2 || manifest.queueJobId !== expectedJobId))
+    throw new Error("manifest采集任务ID与Agent租约不一致");
   const files = manifest.files as Record<string, Record<string, unknown>>;
   const verification = manifest.verification as Record<string, unknown>;
   if (manifest.page !== input.page || manifest.selectedCount !== input.selectedCount || manifest.cvIdSetSha256 !== input.cvIdSetSha256 || files?.excel?.sha256 !== input.excelSha256 || files?.pdfArchive?.sha256 !== input.pdfSha256 || verification?.exactMatch !== true || verification?.zipCrcFailures !== 0) {

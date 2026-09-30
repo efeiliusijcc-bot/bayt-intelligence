@@ -250,7 +250,7 @@ export class PeopleRepository {
     return this.list().find((person) => person.cvId === cvId) || null;
   }
 
-  getAttachment(attachmentId: string): StoredAttachment | null {
+  getAttachment(attachmentId: string, knownPerson?: PersonView | null): StoredAttachment | null {
     this.refreshDatabase();
     const separator = attachmentId.indexOf(":");
     if (separator < 1) return null;
@@ -270,7 +270,7 @@ export class PeopleRepository {
         return attachment;
       }
     }
-    const imported = this.get(cvId);
+    const imported = knownPerson === undefined ? this.get(cvId) : knownPerson;
     const view = imported?.attachments.find((attachment) => attachment.id === attachmentId);
     if (!view) return null;
     const importedPath = path.join(config.runtimeDirectory, "imported", cvId, `${kind}.pdf`);

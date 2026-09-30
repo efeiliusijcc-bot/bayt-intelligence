@@ -35,10 +35,22 @@ test("人物卡片展示真实附件状态且不伪造评分", async () => {
   const rendered = render(<FluentProvider theme={appTheme}><MemoryRouter><PersonCard person={person} /></MemoryRouter></FluentProvider>);
   expect(screen.getByText("Test Candidate")).toBeInTheDocument();
   expect(screen.getByText("Bayt PDF 已绑定")).toBeInTheDocument();
+  expect(screen.getByText("未知来源")).toBeInTheDocument();
   expect(screen.getAllByText("未评分")).toHaveLength(2);
   expect(screen.queryByText(/\d+\s*\/\s*100/)).not.toBeInTheDocument();
   rendered.unmount();
   await new Promise<void>((resolve) => setTimeout(resolve, 0));
+});
+
+test("同一人物展示全部已确认的采集任务来源", async () => {
+  const sourced = { ...person, collectionTasks: [
+    { id: "job-one", name: "第一任务", page: 1, importedAt: "2026-09-29T00:00:00Z" },
+    { id: "job-two", name: "第二任务", page: 2, importedAt: "2026-09-29T01:00:00Z" },
+  ] };
+  const rendered = render(<FluentProvider theme={appTheme}><MemoryRouter><PersonCard person={sourced} /></MemoryRouter></FluentProvider>);
+  expect(screen.getByRole("link", { name: "第一任务" })).toHaveAttribute("href", "/collector/jobs/job-one");
+  expect(screen.getByRole("link", { name: "第二任务" })).toHaveAttribute("href", "/collector/jobs/job-two");
+  rendered.unmount();
 });
 
 test("评分完成后人物卡片展示真实职业分和研究门槛结果", async () => {
@@ -78,7 +90,7 @@ test("人物分页能够从第一页进入第二页", async () => {
   expect(await screen.findByText("第 1 / 13 页")).toBeInTheDocument();
   fireEvent.click(screen.getByRole("button", { name: "下一页" }));
   expect(await screen.findByText("第 2 / 13 页")).toBeInTheDocument();
-  expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining("page=2"), undefined);
+  expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining("page=2"), expect.objectContaining({ credentials: "same-origin" }));
 
   rendered.unmount();
   queryClient.clear();

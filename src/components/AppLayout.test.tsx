@@ -3,10 +3,13 @@ import { FluentProvider } from "@fluentui/react-components";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { expect, test } from "vitest";
 import { appTheme } from "../theme";
+import { AuthContext } from "../auth";
 import { AppLayout } from "./AppLayout";
 
 test("主导航优先展示采集任务并隐藏导入任务入口", () => {
   render(
+    <AuthContext.Provider value={{ session: { user: "admin", csrfToken: "test", expiresAt: "2026-10-06T00:00:00Z" },
+      loading: false, login: async () => {}, logout: async () => {} }}>
     <FluentProvider theme={appTheme}>
       <MemoryRouter initialEntries={["/dashboard"]}>
         <Routes>
@@ -15,7 +18,8 @@ test("主导航优先展示采集任务并隐藏导入任务入口", () => {
           </Route>
         </Routes>
       </MemoryRouter>
-    </FluentProvider>,
+    </FluentProvider>
+    </AuthContext.Provider>,
   );
 
   const sidebar = screen.getByRole("complementary", { name: "主导航" });

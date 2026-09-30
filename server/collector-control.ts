@@ -42,6 +42,18 @@ export interface FilterCatalog {
   sorts: SortDefinition[];
   synchronizedAt: string;
   agentId: string;
+  advanced?: AdvancedFilterCatalog | null;
+}
+
+export interface AdvancedFilterCatalog {
+  keywordModes: FilterOption[];
+  nameSupported: boolean;
+  locations: Array<FilterOption & { cities: FilterOption[] }>;
+  jobRoles: FilterOption[];
+  industries: FilterOption[];
+  exclusionSupported: boolean;
+  reliable: boolean;
+  reason?: string | null;
 }
 
 export interface FilterSelection {
@@ -53,10 +65,19 @@ export interface FilterSelection {
 }
 
 export interface SearchSpec {
+  schemaVersion?: 2;
   keyword: string;
   filterSchemaVersion: string;
   filters: FilterSelection[];
   sortKey: string | null;
+  keywordMode?: string;
+  name?: string | null;
+  pastJobLocations?: Array<{ countryKey: string; cityKey: string | null }>;
+  includeJobRoles?: string[];
+  excludeJobRoles?: string[];
+  includeIndustries?: string[];
+  excludeIndustries?: string[];
+  approximateLocationKeyword?: string | null;
 }
 
 export interface CollectionLimits {
@@ -176,6 +197,43 @@ const cleanText = (value: unknown, maximum: number, label: string): string => {
   if (!text) throw new CollectorControlError(`${label}不能为空`, "INVALID_INPUT");
   return text.slice(0, maximum);
 };
+const optionalText = (value: unknown, maximum: number): string =>
+  String(value || "").replace(/[\u0000-\u001f]/g, " ").replace(/\s+/g, " ").trim().slice(0, maximum);
+
+function normalizeAdvanced(input: unknown): AdvancedFilterCatalog | null {
+  if (!input || typeof input !== "object") return null;
+  const raw = input as Record<string, unknown>;
+  const options = (value: unknown, label: string): FilterOption[] => {
+    if (!Array.isArray(value)) throw new CollectorControlError(`${label}目录缺失`, "INVALID_FILTER_CATALOG");
+    const seen = new Set<string>();
+    return value.map((item) => {
+      const entry = (item && typeof item === "object" ? item : {}) as Record<string, unknown>;
+      const key = cleanText(entry.key, 120, `${label}键`);
+      if (!/^[a-z0-9][a-z0-9._:,-]*$/i.test(key) || seen.has(key)) throw new CollectorControlError(`${label}键无效或重复`, "INVALID_FILTER_CATALOG");
+      seen.add(key);
+      return { key, label: cleanText(entry.label, 160, `${label}名称`) };
+    });
+  };
+  const countries = Array.isArray(raw.locations) ? raw.locations : [];
+  const locationKeys = new Set<string>();
+  const locations = countries.map((item) => {
+    const entry = (item && typeof item === "object" ? item : {}) as Record<string, unknown>;
+    const countryKey = cleanText(entry.key, 120, "国家键");
+    if (!/^[a-z0-9][a-z0-9._:-]*$/i.test(countryKey) || locationKeys.has(countryKey)) throw new CollectorControlError("国家键无效或重复", "INVALID_FILTER_CATALOG");
+    locationKeys.add(countryKey);
+    return { key: countryKey, label: cleanText(entry.label, 160, "国家名称"), cities: options(entry.cities, "城市") };
+  });
+  return {
+    keywordModes: options(raw.keywordModes, "关键词模式"),
+    nameSupported: raw.nameSupported === true,
+    locations,
+    jobRoles: options(raw.jobRoles, "职能"),
+    industries: options(raw.industries, "行业"),
+    exclusionSupported: raw.exclusionSupported === true,
+    reliable: raw.reliable === true,
+    reason: optionalText(raw.reason, 240) || null,
+  };
+}
 
 function beijingDateBounds(at = new Date()): { date: string; start: string; end: string } {
   const parts = new Intl.DateTimeFormat("en-CA", {
@@ -274,12 +332,14 @@ function normalizeCatalog(input: unknown, agentId: string): FilterCatalog {
     sortKeys.add(key);
     return { key, label: cleanText(value.label, 160, "排序名称") };
   });
-  const signature = JSON.stringify({ filters, sorts });
+  const advanced = normalizeAdvanced(source.advanced);
+  const signature = JSON.stringify({ filters, sorts, advanced });
   return {
     version: `bayt-${hashToken(signature).slice(0, 16)}`,
     status: "ready",
     filters,
     sorts,
+    advanced,
     synchronizedAt: nowIso(),
     agentId,
   };
@@ -315,7 +375,8 @@ export class CollectorControlStore {
         filters_json TEXT NOT NULL,
         sorts_json TEXT NOT NULL,
         synchronized_at TEXT NOT NULL,
-        agent_id TEXT NOT NULL
+        agent_id TEXT NOT NULL,
+        advanced_json TEXT
       );
       CREATE TABLE IF NOT EXISTS collector_catalog_sync_requests (
         id TEXT PRIMARY KEY,
@@ -375,6 +436,7 @@ export class CollectorControlStore {
         error_code TEXT,
         error_message TEXT,
         scheduled_for TEXT,
+        client_request_id TEXT,
         created_at TEXT NOT NULL,
         started_at TEXT,
         completed_at TEXT,
@@ -400,6 +462,26 @@ export class CollectorControlStore {
         PRIMARY KEY (job_id, page_no),
         FOREIGN KEY (job_id) REFERENCES collector_jobs(id)
       );
+      CREATE TABLE IF NOT EXISTS collector_job_runs (
+        run_id TEXT PRIMARY KEY,
+        job_id TEXT NOT NULL,
+        search_id TEXT NOT NULL,
+        registered_at TEXT NOT NULL,
+        FOREIGN KEY (job_id) REFERENCES collector_jobs(id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_collector_job_runs_job ON collector_job_runs(job_id);
+      CREATE TABLE IF NOT EXISTS collector_job_people (
+        job_id TEXT NOT NULL,
+        run_id TEXT NOT NULL,
+        page_no INTEGER NOT NULL,
+        cv_id TEXT NOT NULL,
+        import_batch_id TEXT NOT NULL,
+        imported_at TEXT NOT NULL,
+        PRIMARY KEY (job_id, cv_id),
+        FOREIGN KEY (job_id) REFERENCES collector_jobs(id),
+        FOREIGN KEY (run_id) REFERENCES collector_job_runs(run_id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_collector_job_people_cv ON collector_job_people(cv_id);
       CREATE TABLE IF NOT EXISTS collector_agents (
         id TEXT PRIMARY KEY,
         name TEXT NOT NULL,
@@ -427,6 +509,11 @@ export class CollectorControlStore {
         created_at TEXT NOT NULL
       );
     `);
+    const catalogColumns = this.db.prepare("PRAGMA table_info(collector_filter_catalogs)").all() as Array<{ name: string }>;
+    if (!catalogColumns.some((column) => column.name === "advanced_json")) this.db.exec("ALTER TABLE collector_filter_catalogs ADD COLUMN advanced_json TEXT");
+    const jobColumns = this.db.prepare("PRAGMA table_info(collector_jobs)").all() as Array<{ name: string }>;
+    if (!jobColumns.some((column) => column.name === "client_request_id")) this.db.exec("ALTER TABLE collector_jobs ADD COLUMN client_request_id TEXT");
+    this.db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_collector_jobs_client_request ON collector_jobs(client_request_id) WHERE client_request_id IS NOT NULL");
   }
 
   close(): void {
@@ -444,6 +531,7 @@ export class CollectorControlStore {
         sorts: parseJson<SortDefinition[]>(row.sorts_json, []),
         synchronizedAt: String(row.synchronized_at),
         agentId: String(row.agent_id),
+        advanced: parseJson<AdvancedFilterCatalog | null>(row.advanced_json, null),
       } : null,
       syncRequest: syncRequest ? {
         id: String(syncRequest.id),
@@ -465,6 +553,7 @@ export class CollectorControlStore {
   }
 
   claimCatalogSync(agentId: string): Record<string, unknown> | null {
+    if (!agentId.startsWith("local-ego-")) return null;
     this.db.exec("BEGIN IMMEDIATE");
     try {
       const owned = this.db.prepare(
@@ -494,13 +583,14 @@ export class CollectorControlStore {
       throw new CollectorControlError("Filter同步请求不存在或不属于当前Agent", "CATALOG_SYNC_NOT_CLAIMED", 409);
     }
     const catalog = normalizeCatalog(input, agentId);
+    if (catalog.advanced && !agentId.startsWith("local-ego-")) throw new CollectorControlError("高级目录只接受本机Ego同步", "ADVANCED_CATALOG_AGENT_MISMATCH", 409);
     this.db.exec("BEGIN IMMEDIATE");
     try {
       this.db.prepare("UPDATE collector_filter_catalogs SET status = 'stale' WHERE status = 'ready'").run();
       this.db.prepare(`INSERT OR REPLACE INTO collector_filter_catalogs(
-        version, status, filters_json, sorts_json, synchronized_at, agent_id
-      ) VALUES (?, 'ready', ?, ?, ?, ?)`)
-        .run(catalog.version, JSON.stringify(catalog.filters), JSON.stringify(catalog.sorts), catalog.synchronizedAt, agentId);
+        version, status, filters_json, sorts_json, synchronized_at, agent_id, advanced_json
+      ) VALUES (?, 'ready', ?, ?, ?, ?, ?)`)
+        .run(catalog.version, JSON.stringify(catalog.filters), JSON.stringify(catalog.sorts), catalog.synchronizedAt, agentId, JSON.stringify(catalog.advanced || null));
       this.db.prepare("UPDATE collector_catalog_sync_requests SET status = 'completed', completed_at = ?, error = NULL WHERE id = ?").run(nowIso(), requestId);
       this.db.exec("COMMIT");
       return catalog;
@@ -517,6 +607,7 @@ export class CollectorControlStore {
 
   validateSearchSpec(input: unknown): SearchSpec {
     const source = (input && typeof input === "object" ? input : {}) as Record<string, unknown>;
+    if (source.schemaVersion === 2) return this.validateAdvancedSearchSpec(source);
     const keyword = cleanText(source.keyword, 160, "搜索关键词");
     if (/https?:\/\/|cookie|authorization|selector|request.?headers?/i.test(keyword)) {
       throw new CollectorControlError("搜索关键词包含不允许的请求信息", "UNSAFE_SEARCH_SPEC");
@@ -567,6 +658,61 @@ export class CollectorControlStore {
       throw new CollectorControlError(`排序方式不在当前白名单: ${sortKey}`, "INVALID_SORT_KEY");
     }
     return { keyword, filterSchemaVersion: catalog.version, filters, sortKey };
+  }
+
+  private validateAdvancedSearchSpec(source: Record<string, unknown>): SearchSpec {
+    const catalog = this.getCatalog().catalog;
+    if (!catalog || catalog.version !== source.filterSchemaVersion || catalog.status !== "ready" ||
+      !catalog.advanced?.reliable || !catalog.agentId.startsWith("local-ego-") ||
+      Date.now() - Date.parse(catalog.synchronizedAt) > 24 * 60 * 60 * 1000) {
+      throw new CollectorControlError("本机Ego高级筛选目录不可用或已过期，请重新同步", "ADVANCED_CATALOG_UNAVAILABLE", 409);
+    }
+    const advanced = catalog.advanced;
+    const keyword = optionalText(source.keyword, 160);
+    const name = optionalText(source.name, 160);
+    const approximateLocationKeyword = optionalText(source.approximateLocationKeyword, 160);
+    if (!keyword && !name && !approximateLocationKeyword) throw new CollectorControlError("至少填写关键词、姓名或近似地点", "INVALID_SEARCH_SPEC");
+    if (name && !/^[\p{L}\p{M}]+(?: [\p{L}\p{M}]+)*$/u.test(name)) {
+      throw new CollectorControlError("官网姓名筛选不接受数字或特殊字符；带连字符的姓名可改用关键词近似搜索", "INVALID_NAME_FILTER", 422);
+    }
+    if ([keyword, name, approximateLocationKeyword].some((value) => /https?:\/\/|cookie|authorization|selector|request.?headers?/i.test(value))) {
+      throw new CollectorControlError("条件包含不允许的请求信息", "UNSAFE_SEARCH_SPEC");
+    }
+    if (name && !advanced.nameSupported) throw new CollectorControlError("官网姓名控件不可用", "ADVANCED_CONTROL_UNAVAILABLE", 409);
+    const keywordMode = String(source.keywordMode || "");
+    if (!advanced.keywordModes.some((item) => item.key === keywordMode)) throw new CollectorControlError("关键词模式不在官网目录", "INVALID_SEARCH_SPEC");
+    const locations = Array.isArray(source.pastJobLocations) ? source.pastJobLocations : [];
+    if (locations.length > 8 || (locations.length && approximateLocationKeyword)) throw new CollectorControlError("精确地点与近似地点必须分别入队", "APPROXIMATE_LOCATION_CONFLICT");
+    const pastJobLocations = locations.map((entry) => {
+      const location = (entry && typeof entry === "object" ? entry : {}) as Record<string, unknown>;
+      const countryKey = String(location.countryKey || "");
+      const cityKey = location.cityKey ? String(location.cityKey) : null;
+      const country = advanced.locations.find((item) => item.key === countryKey);
+      if (!country || (cityKey && !country.cities.some((city) => city.key === cityKey))) throw new CollectorControlError("工作地点不在官网目录", "INVALID_LOCATION_SELECTION");
+      return { countryKey, cityKey };
+    });
+    if (new Set(pastJobLocations.map((item) => `${item.countryKey}:${item.cityKey || ""}`)).size !== pastJobLocations.length) throw new CollectorControlError("工作地点不能重复", "INVALID_LOCATION_SELECTION");
+    const keys = (field: string, allowed: FilterOption[]) => {
+      const raw = source[field];
+      if (!Array.isArray(raw) || raw.length > 30) throw new CollectorControlError(`${field}格式无效`, "INVALID_FILTER_SELECTION");
+      const values = raw.map(String);
+      if (new Set(values).size !== values.length || values.some((key) => !allowed.some((option) => option.key === key))) throw new CollectorControlError(`${field}选项不在官网目录`, "INVALID_FILTER_SELECTION");
+      return values;
+    };
+    const includeJobRoles = keys("includeJobRoles", advanced.jobRoles);
+    const excludeJobRoles = keys("excludeJobRoles", advanced.jobRoles);
+    const includeIndustries = keys("includeIndustries", advanced.industries);
+    const excludeIndustries = keys("excludeIndustries", advanced.industries);
+    if ((!advanced.exclusionSupported && (excludeJobRoles.length || excludeIndustries.length)) ||
+      includeJobRoles.some((key) => excludeJobRoles.includes(key)) || includeIndustries.some((key) => excludeIndustries.includes(key))) {
+      throw new CollectorControlError("排除条件不可用或与包含条件冲突", "INVALID_EXCLUSION_SELECTION");
+    }
+    if (Array.isArray(source.filters) && source.filters.length) throw new CollectorControlError("新版条件不能混用旧Filter", "INVALID_SEARCH_SPEC");
+    const sortKey = source.sortKey ? String(source.sortKey) : null;
+    if (sortKey && !catalog.sorts.some((item) => item.key === sortKey)) throw new CollectorControlError("排序方式不在官网目录", "INVALID_SORT_KEY");
+    return { schemaVersion: 2, keyword, keywordMode, name: name || null, filterSchemaVersion: catalog.version,
+      filters: [], sortKey, pastJobLocations, includeJobRoles, excludeJobRoles, includeIndustries, excludeIndustries,
+      approximateLocationKeyword: approximateLocationKeyword || null };
   }
 
   listTemplates(): SearchTemplate[] {
@@ -627,25 +773,33 @@ export class CollectorControlStore {
     if (templateId && !template) throw new CollectorControlError("搜索模板不存在", "SEARCH_TEMPLATE_NOT_FOUND", 404);
     const searchSpec = template ? this.validateSearchSpec(template.searchSpec) : this.validateSearchSpec(input.searchSpec);
     const limits = normalizeLimits(input.limits);
-    const id = randomId("job");
     const name = cleanText(input.name || template?.name || searchSpec.keyword, 100, "任务名称");
+    const clientRequestId = input.clientRequestId ? String(input.clientRequestId) : null;
+    if (clientRequestId && !/^[a-zA-Z0-9_-]{8,100}$/.test(clientRequestId)) throw new CollectorControlError("请求去重键无效", "INVALID_CLIENT_REQUEST_ID");
+    const id = randomId("job");
     const createdAt = nowIso();
-    this.db.prepare(`INSERT INTO collector_jobs(
-      id, template_id, schedule_id, source, name, search_spec_json, limits_json, status,
-      queue_position, scheduled_for, created_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?)`)
-      .run(
-        id,
-        templateId,
-        input.scheduleId ? String(input.scheduleId) : null,
-        source,
-        name,
-        JSON.stringify(searchSpec),
-        JSON.stringify(limits),
-        this.nextQueuePosition(),
-        input.scheduledFor ? String(input.scheduledFor) : null,
-        createdAt,
-      );
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      if (clientRequestId) {
+        const existing = this.db.prepare("SELECT id FROM collector_jobs WHERE client_request_id = ?").get(clientRequestId) as { id: string } | undefined;
+        if (existing) {
+          const job = this.getJob(existing.id)!;
+          if (job.name !== name || JSON.stringify(job.searchSpec) !== JSON.stringify(searchSpec) || JSON.stringify(job.limits) !== JSON.stringify(limits)) {
+            throw new CollectorControlError("同一请求键对应不同任务", "CLIENT_REQUEST_CONFLICT", 409);
+          }
+          this.db.exec("COMMIT");
+          return job;
+        }
+      }
+      this.db.prepare(`INSERT INTO collector_jobs(
+        id, template_id, schedule_id, source, name, search_spec_json, limits_json, status,
+        queue_position, scheduled_for, created_at, client_request_id
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?)`)
+        .run(id, templateId, input.scheduleId ? String(input.scheduleId) : null, source, name,
+          JSON.stringify(searchSpec), JSON.stringify(limits), this.nextQueuePosition(),
+          input.scheduledFor ? String(input.scheduledFor) : null, createdAt, clientRequestId);
+      this.db.exec("COMMIT");
+    } catch (error) { this.db.exec("ROLLBACK"); throw error; }
     return this.getJob(id)!;
   }
 
@@ -757,9 +911,14 @@ export class CollectorControlStore {
     if (!job || !["paused", "safety_stopped", "failed"].includes(job.status)) {
       throw new CollectorControlError("任务当前不可恢复", "JOB_NOT_RESUMABLE", 409);
     }
+    // A registered Bayt search may already have uploaded pages. The current
+    // queue worker starts a fresh search, so requeuing this job would create a
+    // different searchId and risk repeating the first page.
+    if (job.searchId) {
+      throw new CollectorControlError("已有搜索检查点的任务需要专门续跑核验，不能作为新搜索重新排队", "JOB_CHECKPOINT_RESUME_REQUIRED", 409);
+    }
     this.db.exec("BEGIN IMMEDIATE");
     try {
-      this.db.prepare("UPDATE collector_control_state SET globally_paused = 0, pause_code = NULL, pause_message = NULL, paused_at = NULL, updated_at = ? WHERE singleton = 1").run(nowIso());
       this.db.prepare(`UPDATE collector_jobs SET status = 'queued', queue_position = ?, pause_requested = 0,
         agent_id = NULL, lease_token_hash = NULL, lease_expires_at = NULL, error_code = NULL,
         error_message = NULL, completed_at = NULL WHERE id = ?`).run(this.nextQueuePosition(), id);
@@ -769,6 +928,22 @@ export class CollectorControlStore {
       throw error;
     }
     return this.getJob(id)!;
+  }
+
+  acknowledgeGlobalPause(reason: unknown): Record<string, unknown> {
+    const explanation = cleanText(reason, 500, "解除原因");
+    const active = this.db.prepare("SELECT id FROM collector_jobs WHERE status IN ('running','pause_requested') LIMIT 1").get();
+    if (active) throw new CollectorControlError("仍有运行任务，不能解除全局安全暂停", "ACTIVE_JOB_PRESENT", 409);
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const state = this.getControlState();
+      if (!state.globallyPaused) throw new CollectorControlError("当前没有全局安全暂停", "NOT_GLOBALLY_PAUSED", 409);
+      this.db.prepare("INSERT INTO collector_schedule_events(id, schedule_id, event_type, detail, created_at) VALUES (?, ?, 'global_pause_acknowledged', ?, ?)")
+        .run(randomId("audit"), "global", explanation, nowIso());
+      this.db.prepare("UPDATE collector_control_state SET globally_paused = 0, pause_code = NULL, pause_message = NULL, paused_at = NULL, updated_at = ? WHERE singleton = 1").run(nowIso());
+      this.db.exec("COMMIT");
+    } catch (error) { this.db.exec("ROLLBACK"); throw error; }
+    return this.getControlState();
   }
 
   getControlState(): Record<string, unknown> {
@@ -820,11 +995,13 @@ export class CollectorControlStore {
   recoverExpiredLeases(at = new Date()): number {
     const expired = this.db.prepare("SELECT id FROM collector_jobs WHERE status IN ('running','pause_requested') AND lease_expires_at < ?").all(at.toISOString()) as { id: string }[];
     for (const item of expired) {
-      this.db.prepare(`UPDATE collector_jobs SET status = 'queued', queue_position = ?, pause_requested = 0,
+      this.db.prepare(`UPDATE collector_jobs SET status = 'safety_stopped', queue_position = NULL, pause_requested = 0,
         agent_id = NULL, lease_token_hash = NULL, lease_expires_at = NULL,
-        error_code = 'LEASE_EXPIRED', error_message = 'Agent租约过期，已从最后完整页面恢复' WHERE id = ?`)
-        .run(this.nextQueuePosition(), item.id);
+        error_code = 'LEASE_EXPIRED_REVIEW', error_message = '租约过期；需核对本机下载意图与完整页检查点后人工恢复' WHERE id = ?`)
+        .run(item.id);
     }
+    if (expired.length) this.db.prepare("UPDATE collector_control_state SET globally_paused = 1, pause_code = 'LEASE_EXPIRED_REVIEW', pause_message = '本机采集租约过期，检查未确定下载后再恢复', paused_at = ?, updated_at = ? WHERE singleton = 1")
+      .run(nowIso(), nowIso());
     return expired.length;
   }
 
@@ -836,9 +1013,13 @@ export class CollectorControlStore {
 
   claimJob(agentId: string, leaseMs = 120_000): { job: CollectionJob | null; leaseToken?: string; waitReason?: string; waitUntil?: string } {
     this.recoverExpiredLeases();
+    if (!agentId.startsWith("local-ego-")) return { job: null, waitReason: "local_ego_only" };
     const state = this.getControlState();
     if (state.globallyPaused) return { job: null, waitReason: "global_safety_pause" };
     if (state.runningJobId) return { job: null, waitReason: "another_job_running" };
+    const catalog = this.getCatalog().catalog;
+    if (!catalog?.advanced?.reliable || !catalog.agentId.startsWith("local-ego-") ||
+      Date.now() - Date.parse(catalog.synchronizedAt) > 24 * 60 * 60 * 1000) return { job: null, waitReason: "catalog_unavailable" };
     this.db.exec("BEGIN IMMEDIATE");
     try {
       const running = this.db.prepare("SELECT id FROM collector_jobs WHERE status IN ('running','pause_requested') LIMIT 1").get();
@@ -846,10 +1027,15 @@ export class CollectorControlStore {
         this.db.exec("COMMIT");
         return { job: null, waitReason: "another_job_running" };
       }
-      const row = this.db.prepare("SELECT id FROM collector_jobs WHERE status = 'queued' ORDER BY queue_position, created_at LIMIT 1").get() as { id?: string } | undefined;
+      const row = this.db.prepare("SELECT id, search_id FROM collector_jobs WHERE status = 'queued' AND json_extract(search_spec_json, '$.schemaVersion') = 2 AND json_extract(search_spec_json, '$.filterSchemaVersion') = ? ORDER BY queue_position, created_at LIMIT 1").get(catalog.version) as { id?: string; search_id?: string | null } | undefined;
+      if (row?.search_id) {
+        this.db.exec("COMMIT");
+        return { job: null, waitReason: "checkpoint_resume_required" };
+      }
       if (!row?.id) {
         this.db.exec("COMMIT");
-        return { job: null, waitReason: "queue_empty" };
+        const legacy = this.db.prepare("SELECT id FROM collector_jobs WHERE status = 'queued' LIMIT 1").get();
+        return { job: null, waitReason: legacy ? "search_requires_revalidation" : "queue_empty" };
       }
       const queuedJob = this.getJob(row.id);
       if (!queuedJob?.limits.durationHours && 500 - this.dailyExportedCount() < 50) {
@@ -879,6 +1065,78 @@ export class CollectorControlStore {
     return this.jobFromRow(row);
   }
 
+  registerRun(jobId: string, agentId: string, leaseToken: string, runId: unknown, searchId: unknown): void {
+    const job = this.verifyLease(jobId, agentId, leaseToken);
+    const run = String(runId || "");
+    const search = String(searchId || "");
+    if (job.status !== "running" || job.searchSpec.schemaVersion !== 2 ||
+      !/^local-ego-[A-Za-z0-9_-]{1,70}$/.test(run) || !/^[A-Za-z0-9_-]{4,200}$/.test(search) ||
+      (job.searchId && job.searchId !== search)) {
+      throw new CollectorControlError("任务运行标识不匹配", "RUN_JOB_LINK_INVALID", 409);
+    }
+    const existing = this.db.prepare("SELECT job_id, search_id FROM collector_job_runs WHERE run_id = ?").get(run) as
+      { job_id: string; search_id: string } | undefined;
+    if (existing && (existing.job_id !== jobId || existing.search_id !== search))
+      throw new CollectorControlError("运行ID已绑定其他任务", "RUN_JOB_LINK_CONFLICT", 409);
+    this.db.prepare("INSERT OR IGNORE INTO collector_job_runs(run_id, job_id, search_id, registered_at) VALUES (?, ?, ?, ?)")
+      .run(run, jobId, search, nowIso());
+    this.db.prepare("UPDATE collector_jobs SET search_id = COALESCE(search_id, ?) WHERE id = ?").run(search, jobId);
+  }
+
+  jobForRun(runId: string): string | null {
+    const row = this.db.prepare("SELECT job_id FROM collector_job_runs WHERE run_id = ?").get(runId) as { job_id: string } | undefined;
+    return row?.job_id || null;
+  }
+
+  recordDisplayedPeople(input: { jobId: string; runId: string; page: number; importBatchId: string; cvIds: string[]; importedAt?: string }): void {
+    if (this.jobForRun(input.runId) !== input.jobId || !Number.isInteger(input.page) || input.page < 1 ||
+      !input.importBatchId || !input.cvIds.length || input.cvIds.length > 50 ||
+      new Set(input.cvIds).size !== input.cvIds.length || input.cvIds.some((id) => !/^\d+$/.test(id)))
+      throw new CollectorControlError("人物溯源证据不匹配", "PERSON_PROVENANCE_INVALID", 409);
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const importedAt = input.importedAt && Number.isFinite(Date.parse(input.importedAt)) ? input.importedAt : nowIso();
+      for (const cvId of input.cvIds) {
+        const existing = this.db.prepare("SELECT run_id, page_no, import_batch_id FROM collector_job_people WHERE job_id = ? AND cv_id = ?")
+          .get(input.jobId, cvId) as { run_id: string; page_no: number; import_batch_id: string } | undefined;
+        if (existing && (existing.run_id !== input.runId || existing.page_no !== input.page || existing.import_batch_id !== input.importBatchId))
+          throw new CollectorControlError("同一任务的人物来源发生冲突", "PERSON_PROVENANCE_CONFLICT", 409);
+        this.db.prepare("INSERT OR IGNORE INTO collector_job_people(job_id, run_id, page_no, cv_id, import_batch_id, imported_at) VALUES (?, ?, ?, ?, ?, ?)")
+          .run(input.jobId, input.runId, input.page, cvId, input.importBatchId, importedAt);
+      }
+      this.db.exec("COMMIT");
+    } catch (error) { this.db.exec("ROLLBACK"); throw error; }
+  }
+
+  peopleForJob(jobId: string): Array<{ cvId: string; runId: string; page: number; importBatchId: string; importedAt: string }> {
+    return (this.db.prepare("SELECT cv_id, run_id, page_no, import_batch_id, imported_at FROM collector_job_people WHERE job_id = ? ORDER BY page_no, cv_id")
+      .all(jobId) as Array<{ cv_id: string; run_id: string; page_no: number; import_batch_id: string; imported_at: string }> )
+      .map((row) => ({ cvId: row.cv_id, runId: row.run_id, page: row.page_no, importBatchId: row.import_batch_id, importedAt: row.imported_at }));
+  }
+
+  personForJob(jobId: string, cvId: string): { importBatchId: string; runId: string; page: number } | null {
+    const row = this.db.prepare("SELECT import_batch_id, run_id, page_no FROM collector_job_people WHERE job_id = ? AND cv_id = ?")
+      .get(jobId, cvId) as { import_batch_id: string; run_id: string; page_no: number } | undefined;
+    return row ? { importBatchId: row.import_batch_id, runId: row.run_id, page: row.page_no } : null;
+  }
+
+  sourcesForPeople(cvIds: string[], isDisplayed: (runId: string, page: number) => boolean = () => true): Map<string, Array<{ id: string; name: string; page: number; importedAt: string }>> {
+    const result = new Map<string, Array<{ id: string; name: string; page: number; importedAt: string }>>();
+    if (!cvIds.length) return result;
+    const unique = [...new Set(cvIds)].filter((id) => /^\d+$/.test(id));
+    if (!unique.length) return result;
+    const placeholders = unique.map(() => "?").join(",");
+    const rows = this.db.prepare(`SELECT p.cv_id, p.job_id, p.run_id, j.name, p.page_no, p.imported_at FROM collector_job_people p JOIN collector_jobs j ON j.id = p.job_id WHERE p.cv_id IN (${placeholders}) ORDER BY p.imported_at DESC, p.job_id`)
+      .all(...unique) as Array<{ cv_id: string; job_id: string; run_id: string; name: string; page_no: number; imported_at: string }>;
+    for (const row of rows) {
+      if (!isDisplayed(row.run_id, row.page_no)) continue;
+      const items = result.get(row.cv_id) || [];
+      items.push({ id: row.job_id, name: row.name, page: row.page_no, importedAt: row.imported_at });
+      result.set(row.cv_id, items);
+    }
+    return result;
+  }
+
   heartbeatJob(jobId: string, agentId: string, leaseToken: string, evidence: Record<string, unknown> = {}, leaseMs = 120_000): CollectionJob {
     const job = this.verifyLease(jobId, agentId, leaseToken);
     this.db.prepare(`UPDATE collector_jobs SET lease_expires_at = ?, search_id = COALESCE(?, search_id),
@@ -886,7 +1144,8 @@ export class CollectorControlStore {
       WHERE id = ?`).run(
         new Date(Date.now() + leaseMs).toISOString(),
         evidence.searchId ? String(evidence.searchId).slice(0, 200) : null,
-        Number.isInteger(Number(evidence.matchedCount)) ? Number(evidence.matchedCount) : null,
+        evidence.matchedCount !== null && evidence.matchedCount !== undefined &&
+          Number.isInteger(Number(evidence.matchedCount)) && Number(evidence.matchedCount) >= 0 ? Number(evidence.matchedCount) : null,
         Array.isArray(evidence.actualFilterLabels) ? 1 : null,
         Array.isArray(evidence.actualFilterLabels) ? JSON.stringify(evidence.actualFilterLabels.map(String).slice(0, 100)) : null,
         jobId,
@@ -913,6 +1172,11 @@ export class CollectorControlStore {
     const remoteBatch = String(input.remoteBatch || "");
     if (!Number.isInteger(excelSize) || excelSize <= 0 || !Number.isInteger(pdfSize) || pdfSize <= 0 || !Number.isInteger(pdfEntries) || pdfEntries !== selectedCount || input.zipCrcOk !== true || !/^\/[a-z0-9/._-]+$/i.test(remoteBatch) || remoteBatch.includes("..")) {
       throw new CollectorControlError("页级文件验收证据不完整", "INVALID_PAGE_CHECKPOINT");
+    }
+    if (job.searchSpec.schemaVersion === 2) {
+      const match = remoteBatch.match(/\/(local-ego-[A-Za-z0-9_-]{1,70})\/batch-(\d{4})$/);
+      if (!match || Number(match[2]) !== page || this.jobForRun(match[1]) !== jobId)
+        throw new CollectorControlError("页级批次不属于该任务", "RUN_JOB_LINK_INVALID", 409);
     }
     const existing = this.db.prepare("SELECT * FROM collector_job_pages WHERE job_id = ? AND page_no = ?").get(jobId, page) as Record<string, unknown> | undefined;
     if (existing) {

@@ -57,6 +57,18 @@ export interface PersonView {
     | "FAILED";
   sourceTags: string[];
   importedAt: string | null;
+  collectionTasks?: Array<{ id: string; name: string; page: number; importedAt: string }>;
+}
+
+export interface CollectorJobPeopleResponse {
+  items: Array<{ cvId: string; runId: string; page: number; importBatchId: string; importedAt: string; person: PersonView }>;
+  page: number;
+  pageSize: number;
+  total: number;
+  exportedCount: number;
+  pendingImportCount: number;
+  pendingPages: number;
+  blockedPages: number;
 }
 
 export interface PeopleResponse {
@@ -245,6 +257,16 @@ export interface CollectorFilterCatalog {
   sorts: Array<{ key: string; label: string }>;
   synchronizedAt: string;
   agentId: string;
+  advanced?: {
+    keywordModes: Array<{ key: string; label: string }>;
+    nameSupported: boolean;
+    locations: Array<{ key: string; label: string; cities: Array<{ key: string; label: string }> }>;
+    jobRoles: Array<{ key: string; label: string }>;
+    industries: Array<{ key: string; label: string }>;
+    exclusionSupported: boolean;
+    reliable: boolean;
+    reason?: string | null;
+  } | null;
 }
 
 export interface CollectorFilterSelection {
@@ -256,10 +278,19 @@ export interface CollectorFilterSelection {
 }
 
 export interface CollectorSearchSpec {
+  schemaVersion?: 2;
   keyword: string;
   filterSchemaVersion: string;
   filters: CollectorFilterSelection[];
   sortKey: string | null;
+  keywordMode?: string;
+  name?: string | null;
+  pastJobLocations?: Array<{ countryKey: string; cityKey: string | null }>;
+  includeJobRoles?: string[];
+  excludeJobRoles?: string[];
+  includeIndustries?: string[];
+  excludeIndustries?: string[];
+  approximateLocationKeyword?: string | null;
 }
 
 export interface CollectorLimits {

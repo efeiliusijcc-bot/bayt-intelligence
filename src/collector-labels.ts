@@ -41,6 +41,10 @@ const labels: Record<string, string> = {
   'CVs Without Tags': '无标签', 'Contact information': '联系方式', Experience: '工作经历',
   'Mobile confirmation': '手机已验证', Photo: '照片', Relevance: '相关度', Relevancy: '相关度',
   'Last Update': '最近更新', 'Most relevant': '最相关', 'Most recently updated': '最近更新', 'Newest first': '最新优先',
+  'Any words': '任意词', 'Exact order': '精确顺序', Boolean: '布尔表达式', 'All words': '全部词',
+  Syria: '叙利亚', Afghanistan: '阿富汗',
+  'Logistics and Transportation': '物流与运输', 'Teaching and Academics': '教学与学术',
+  'Non-profit Organization': '非营利组织', 'Religious Institution & Place of Worship': '宗教机构与礼拜场所',
 };
 const normalized = new Map(Object.entries(labels).map(([key, value]) => [key.toLowerCase(), value]));
 const reasons = new Map([

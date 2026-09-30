@@ -12,6 +12,7 @@
     "verify": "node --experimental-strip-types src/cli.ts verify",
     "worker": "node --experimental-strip-types src/worker.ts",
     "windows-agent": "node --experimental-strip-types src/windows-agent.ts",
+    "local-ego-queue": "node --experimental-strip-types scripts/local-ego-queue.mjs",
     "test": "node scripts/run-tests.mjs",
     "check": "npm test && tsc --noEmit"
   },

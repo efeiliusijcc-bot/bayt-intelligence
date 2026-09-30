@@ -3,7 +3,9 @@ import path from "node:path";
 import express, { type NextFunction, type Request, type Response } from "express";
 import mime from "mime-types";
 import multer from "multer";
+import yauzl from "yauzl";
 import { AuditStore } from "./audit.ts";
+import { BrowserAuthStore } from "./browser-auth.ts";
 import { assertProductionConfiguration, config } from "./config.ts";
 import { AnalyticsFilterError, DashboardAnalyticsService } from "./dashboard-analytics.ts";
 import { ImportService } from "./import-service.ts";
@@ -11,7 +13,8 @@ import { IncomingConsumer } from "./incoming-consumer.ts";
 import { PeopleRepository } from "./people-repository.ts";
 import { ResearchService } from "./research-service.ts";
 import type { ResearchPolicy } from "./research-types.ts";
-import { basicAuth, issueFileToken, securityHeaders, verifyFileToken } from "./security.ts";
+import { authenticatedUser, browserSessionGuard, clearSessionCookie, currentSession, issueFileToken,
+  requireLoginCsrf, requireSameOrigin, requireSessionCsrf, securityHeaders, sessionCookie, sessionToken, verifyFileToken } from "./security.ts";
 import { CollectorClientError, collectorRequest, requireCollectorBrowserMutation } from "./collector-client.ts";
 import { CollectorControlStore } from "./collector-control.ts";
 import { collectorRouteError, createCollectorAgentRouter, createCollectorControlRouter } from "./collector-routes.ts";
@@ -25,10 +28,15 @@ const app = express();
 const peopleRepository = new PeopleRepository();
 const dashboardAnalyticsService = new DashboardAnalyticsService(peopleRepository);
 const importService = new ImportService(peopleRepository);
-const incomingConsumer = new IncomingConsumer(importService, peopleRepository);
+const collectorControl = new CollectorControlStore(config.collectorControlDbPath);
+const incomingConsumer = new IncomingConsumer(importService, peopleRepository,
+  config.collectorIncomingRoot, config.runtimeDirectory, config.collectorIncomingRemoteRoot,
+  undefined, collectorControl);
 const researchService = new ResearchService(peopleRepository);
 const audit = new AuditStore();
-const collectorControl = new CollectorControlStore(config.collectorControlDbPath);
+const browserAuth = new BrowserAuthStore(config.authSessionDbPath, () => ({
+  user: config.appUser, password: config.appPassword, secret: config.previewSecret,
+}));
 const upload = multer({
   dest: uploadDirectory,
   limits: { fileSize: 30 * 1024 * 1024, files: 2, fields: 5 },
@@ -44,17 +52,43 @@ app.use("/api/v1/collector/agent", createCollectorAgentRouter(collectorControl, 
   localRoot: config.collectorIncomingRoot,
   remoteRoot: config.collectorIncomingRemoteRoot,
 }));
-app.use(basicAuth);
+app.post("/api/v1/auth/login", requireSameOrigin, requireLoginCsrf, (request, response) => {
+  response.setHeader("Cache-Control", "no-store");
+  const user = typeof request.body?.user === "string" ? request.body.user : "";
+  const password = typeof request.body?.password === "string" ? request.body.password : "";
+  if (user.length > 256 || password.length > 1024) {
+    response.status(400).json({ error: { code: "LOGIN_INVALID", message: "账号或密码错误" } });
+    return;
+  }
+  const clientIp = String(request.headers["x-real-ip"] || request.socket.remoteAddress || "unknown");
+  const result = browserAuth.login(user, password, clientIp);
+  if (result.status === "limited") {
+    audit.record({ action: "AUTH_LOGIN_LIMITED", actor: null });
+    response.setHeader("Retry-After", String(result.retryAfterSeconds));
+    response.status(429).json({ error: { code: "LOGIN_RATE_LIMITED", message: "尝试次数过多，请稍后重试" } });
+    return;
+  }
+  if (result.status === "invalid") {
+    audit.record({ action: "AUTH_LOGIN_FAILED", actor: null });
+    response.status(401).json({ error: { code: "LOGIN_INVALID", message: "账号或密码错误" } });
+    return;
+  }
+  browserAuth.revoke(sessionToken(request));
+  response.setHeader("Set-Cookie", sessionCookie(result.token));
+  audit.record({ action: "AUTH_LOGIN", actor: result.session.user });
+  response.json(result.session);
+});
+app.use("/api", browserSessionGuard(browserAuth), requireSessionCsrf);
+app.get("/api/v1/auth/me", (request, response) => response.json(currentSession(request)));
+app.post("/api/v1/auth/logout", (request, response) => {
+  browserAuth.revoke(sessionToken(request));
+  response.setHeader("Set-Cookie", clearSessionCookie());
+  audit.record({ action: "AUTH_LOGOUT", actor: authenticatedUser(request) });
+  response.sendStatus(204);
+});
 
 function actor(request: Request): string {
-  const authorization = request.headers.authorization || "";
-  try {
-    return authorization.startsWith("Basic ")
-      ? Buffer.from(authorization.slice(6), "base64").toString("utf8").split(":")[0] || "local-user"
-      : "local-user";
-  } catch {
-    return "local-user";
-  }
+  return authenticatedUser(request) || "local-user";
 }
 
 function parsePositiveInteger(value: unknown, fallback: number, maximum: number): number {
@@ -135,7 +169,11 @@ app.get("/api/v1/people", (request, response) => {
   });
   const start = (page - 1) * pageSize;
   const nationalities = [...new Set(peopleRepository.list().map((person) => person.nationality).filter(Boolean))].sort();
-  response.json({ items: people.slice(start, start + pageSize), page, pageSize, total: people.length, facets: { nationalities } });
+  const selected = people.slice(start, start + pageSize);
+  const sources = collectorControl.sourcesForPeople(selected.map((person) => person.cvId),
+    (runId, sourcePage) => incomingConsumer.isDisplayed(runId, sourcePage));
+  response.json({ items: selected.map((person) => ({ ...person, collectionTasks: sources.get(person.cvId) || [] })),
+    page, pageSize, total: people.length, facets: { nationalities } });
 });
 
 app.get("/api/v1/people/:cvId", (request, response) => {
@@ -146,8 +184,79 @@ app.get("/api/v1/people/:cvId", (request, response) => {
     return;
   }
   audit.record({ action: "VIEW_PERSON", cvId: person.cvId, actor: actor(request) });
-  response.json(person);
+  response.json({ ...person, collectionTasks: collectorControl.sourcesForPeople([person.cvId],
+    (runId, sourcePage) => incomingConsumer.isDisplayed(runId, sourcePage)).get(person.cvId) || [] });
 });
+
+app.get("/api/v1/collector/jobs/:id/people", async (request, response, next) => {
+  try {
+    const job = collectorControl.getJob(String(request.params.id));
+    if (!job) {
+      response.status(404).json({ error: { code: "COLLECTION_JOB_NOT_FOUND", message: "采集任务不存在" } });
+      return;
+    }
+    const page = parsePositiveInteger(request.query.page, 1, 100000);
+    const pageSize = parsePositiveInteger(request.query.pageSize, 12, 50);
+    const people = new Map(peopleRepository.list().map((person) => [person.cvId, person]));
+    const records = collectorControl.peopleForJob(job.id).filter((item) => {
+      if (!incomingConsumer.isDisplayed(item.runId, item.page)) return false;
+      const person = people.get(item.cvId);
+      const pdf = peopleRepository.getAttachment(`${item.cvId}:bayt_pdf`, person);
+      const batch = importService.get(item.importBatchId, true);
+      return !!person?.attachments.some((attachment) => attachment.kind === "bayt_pdf" && attachment.status === "downloaded") &&
+        !!pdf?.path && fs.existsSync(pdf.path) && batch?.status === "COMPLETED" &&
+        !!batch.files?.zipPath && fs.existsSync(batch.files.zipPath) &&
+        batch.matches.some((match) => match.cvId === item.cvId && match.status === "SUCCESS" && match.pdfFile);
+    });
+    const sources = collectorControl.sourcesForPeople(records.slice((page - 1) * pageSize, page * pageSize).map((item) => item.cvId),
+      (runId, sourcePage) => incomingConsumer.isDisplayed(runId, sourcePage));
+    const items = records.slice((page - 1) * pageSize, page * pageSize).map((item) => ({
+      ...item, person: { ...researchService.decoratePerson(people.get(item.cvId)!),
+        collectionTasks: sources.get(item.cvId) || [] },
+    }));
+    const incoming = (await incomingConsumer.list()).filter((item) => collectorControl.jobForRun(item.runId) === job.id);
+    audit.record({ action: "VIEW_COLLECTOR_JOB_PEOPLE", actor: actor(request), detail: job.id });
+    response.json({ items, page, pageSize, total: records.length,
+      exportedCount: job.exportedCount, pendingImportCount: job.searchSpec.schemaVersion === 2 ? Math.max(0, job.exportedCount - records.length) : 0,
+      pendingPages: incoming.filter((item) => item.status === "pending" || item.status === "processing").length,
+      blockedPages: incoming.filter((item) => item.status === "blocked").length });
+  } catch (error) { next(error); }
+});
+
+function taskPdfSource(attachmentId: string): { cvId: string; zipPath: string; entryName: string } | null {
+  const match = attachmentId.match(/^(job-[A-Za-z0-9_-]+):(\d+)$/);
+  if (!match) return null;
+  const source = collectorControl.personForJob(match[1], match[2]);
+  if (!source || !incomingConsumer.isDisplayed(source.runId, source.page)) return null;
+  const batch = importService.get(source.importBatchId, true);
+  const entryName = batch?.matches.find((item) => item.cvId === match[2] && item.status === "SUCCESS")?.pdfFile;
+  if (batch?.status !== "COMPLETED" || !batch.files?.zipPath || !entryName || !fs.existsSync(batch.files.zipPath)) return null;
+  return { cvId: match[2], zipPath: batch.files.zipPath, entryName };
+}
+
+function streamTaskPdf(source: { cvId: string; zipPath: string; entryName: string }, response: Response, next: NextFunction): void {
+  yauzl.open(source.zipPath, { lazyEntries: true, autoClose: true }, (error, zip) => {
+    if (error || !zip) { next(error || new Error("PDF批次不可读取")); return; }
+    let found = false;
+    zip.on("entry", (entry) => {
+      if (entry.fileName !== source.entryName) { zip.readEntry(); return; }
+      found = true;
+      if (entry.uncompressedSize > 25 * 1024 * 1024) { zip.close(); next(new Error("PDF条目超过上限")); return; }
+      zip.openReadStream(entry, (streamError, stream) => {
+        if (streamError || !stream) { zip.close(); next(streamError || new Error("PDF条目不可读取")); return; }
+        response.setHeader("Cache-Control", "private, no-store");
+        response.setHeader("Content-Type", "application/pdf");
+        response.setHeader("Content-Disposition", `inline; filename*=UTF-8''${encodeURIComponent(`${source.cvId}.pdf`)}`);
+        stream.on("error", next);
+        response.on("close", () => zip.close());
+        stream.pipe(response);
+      });
+    });
+    zip.on("end", () => { if (!found && !response.headersSent) response.status(404).json({ error: { code: "TASK_PDF_NOT_FOUND", message: "该任务简历不可用" } }); });
+    zip.on("error", next);
+    zip.readEntry();
+  });
+}
 
 app.get("/api/v1/people/:cvId/avatar", (request, response) => {
   const avatarPath = peopleRepository.getAvatar(request.params.cvId);
@@ -165,6 +274,15 @@ app.get("/api/v1/people/:cvId/audit", (request, response) => {
 });
 
 app.get("/api/v1/attachments/:attachmentId/preview-url", (request, response) => {
+  const taskSource = taskPdfSource(request.params.attachmentId);
+  if (taskSource) {
+    const token = issueFileToken(request.params.attachmentId, "inline");
+    audit.record({ action: "PREVIEW_TASK_PDF", cvId: taskSource.cvId, attachmentId: request.params.attachmentId, actor: actor(request) });
+    response.setHeader("Cache-Control", "no-store");
+    response.json({ url: `/api/v1/files/${encodeURIComponent(request.params.attachmentId)}?token=${encodeURIComponent(token)}`,
+      expiresAt: new Date(Date.now() + 5 * 60 * 1000).toISOString() });
+    return;
+  }
   const attachment = peopleRepository.getAttachment(request.params.attachmentId);
   if (!attachment || !attachment.previewable) {
     response.status(404).json({ error: { code: "PREVIEW_NOT_AVAILABLE", message: "该附件暂不支持在线预览" } });
@@ -192,6 +310,12 @@ app.get("/api/v1/files/:attachmentId", (request, response) => {
   const verified = verifyFileToken(String(request.query.token || ""));
   if (!verified || verified.attachmentId !== request.params.attachmentId) {
     response.status(403).json({ error: { code: "FILE_TOKEN_INVALID", message: "文件访问链接已失效，请重新获取" } });
+    return;
+  }
+  const taskSource = taskPdfSource(verified.attachmentId);
+  if (taskSource && verified.disposition === "inline") {
+    audit.record({ action: "STREAM_TASK_PDF", cvId: taskSource.cvId, attachmentId: verified.attachmentId, actor: actor(request) });
+    streamTaskPdf(taskSource, response, (error) => { if (!response.headersSent) response.status(500).json({ error: { code: "TASK_PDF_READ_FAILED", message: "任务PDF暂时无法读取" } }); else response.destroy(error as Error); });
     return;
   }
   const attachment = peopleRepository.getAttachment(verified.attachmentId);
@@ -438,15 +562,6 @@ app.use((error: unknown, _request: Request, response: Response, _next: NextFunct
 });
 
 await importService.initializeBuiltInSample();
-
-if (!collectorControl.listTemplates().length && config.collectorEnabled) {
-  try {
-    const legacy = await collectorRequest<{ items?: Array<Record<string, unknown>> }>("/tasks");
-    collectorControl.importLegacyTasks(Array.isArray(legacy.items) ? legacy.items : []);
-  } catch (error) {
-    console.error("collector_legacy_task_migration_skipped", error instanceof Error ? error.message : String(error));
-  }
-}
 
 if (process.env.NODE_ENV !== "test") {
   void incomingConsumer.scan().catch((error) => console.error("incoming_scan_failed", error instanceof Error ? error.message : String(error)));
