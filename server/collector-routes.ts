@@ -40,6 +40,17 @@ export function createCollectorAgentRouter(store: CollectorControlStore, token: 
     }
   });
 
+  router.post("/verification/claim", (request, response, next) => {
+    try { response.json({ request: store.claimVerification(bodyAgentId(request), String(request.body?.verificationId || "")) }); }
+    catch (error) { next(error); }
+  });
+  router.post("/verification/complete", (request, response, next) => {
+    try {
+      store.completeVerification(bodyAgentId(request), String(request.body?.requestId || ""), String(request.body?.verificationId || ""), request.body?.verified === true);
+      response.sendStatus(204);
+    } catch (error) { next(error); }
+  });
+
   router.post("/filter-catalog/claim", (request, response, next) => {
     try {
       response.json({ request: store.claimCatalogSync(bodyAgentId(request)) });
@@ -75,7 +86,7 @@ export function createCollectorAgentRouter(store: CollectorControlStore, token: 
 
   router.post("/jobs/:id/runs", (request, response, next) => {
     try {
-      store.registerRun(String(request.params.id), bodyAgentId(request), leaseToken(request), request.body?.runId, request.body?.searchId);
+      store.registerRun(String(request.params.id), bodyAgentId(request), leaseToken(request), request.body?.runId, request.body?.searchId, request.body?.uploadToken);
       response.sendStatus(204);
     } catch (error) { next(error); }
   });
@@ -88,6 +99,11 @@ export function createCollectorAgentRouter(store: CollectorControlStore, token: 
     }
   });
 
+  router.post("/jobs/:id/state", (request, response, next) => {
+    try { response.json(store.agentJobState(String(request.params.id), bodyAgentId(request))); }
+    catch (error) { next(error); }
+  });
+
   router.post("/jobs/:id/checkpoints", async (request, response, next) => {
     try {
       await verifyIncomingBatch(request.body || {}, incoming.localRoot, incoming.remoteRoot, String(request.params.id));
@@ -95,6 +111,27 @@ export function createCollectorAgentRouter(store: CollectorControlStore, token: 
     } catch (error) {
       next(error);
     }
+  });
+
+  router.post("/jobs/:id/local-pages", (request, response, next) => {
+    try { response.json(store.reportLocalPages(String(request.params.id), bodyAgentId(request), leaseToken(request), request.body || {})); }
+    catch (error) { next(error); }
+  });
+  router.post("/jobs/:id/collection-complete", (request, response, next) => {
+    try { response.json(store.finishCollection(String(request.params.id), bodyAgentId(request), leaseToken(request), request.body || {})); }
+    catch (error) { next(error); }
+  });
+  router.post("/jobs/:id/uploads", async (request, response, next) => {
+    try {
+      const id = String(request.params.id);
+      store.authorizeUpload(id, bodyAgentId(request), String(request.body?.runId || ""), String(request.body?.uploadToken || ""));
+      await verifyIncomingBatch(request.body || {}, incoming.localRoot, incoming.remoteRoot, id);
+      response.json(store.checkpointUpload(id, bodyAgentId(request), request.body || {}));
+    } catch (error) { next(error); }
+  });
+  router.post("/jobs/:id/delivery-error", (request, response, next) => {
+    try { store.reportDeliveryError(String(request.params.id), bodyAgentId(request), request.body || {}); response.sendStatus(204); }
+    catch (error) { next(error); }
   });
 
   router.post("/jobs/:id/complete", (request, response, next) => {
@@ -132,6 +169,13 @@ export function createCollectorControlRouter(
   const router = Router();
 
   router.get("/filter-catalog", (_request, response) => response.json(store.getCatalog()));
+  router.post("/verification", requireBrowserMutation, (request, response, next) => {
+    try {
+      const result = store.requestVerification(String(request.body?.agentId || ""), String(request.body?.verificationId || ""));
+      record(request, "COLLECTOR_USER_VERIFIED", String(result.id));
+      response.status(202).json(result);
+    } catch (error) { next(error); }
+  });
   router.post("/filter-catalog/sync", requireBrowserMutation, (request, response, next) => {
     try {
       const result = store.requestCatalogSync();

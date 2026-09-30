@@ -3,15 +3,15 @@ import test from 'node:test';
 import fsp from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { assertNewSearchAllowed, blockedByExistingRun, bootstrapRun, checkpointInput,
-  claimedActive, completeRunRegistration, startSearchFailure, verificationPending } from '../scripts/local-ego-queue.mjs';
+import { assertNewSearchAllowed, assertResumeClaim, blockedByExistingRun, bootstrapRun, checkpointInput,
+  claimedActive, completeRunRegistration, startSearchFailure, terminalAcknowledged, verificationPending, withLeaseHeartbeat } from '../scripts/local-ego-queue.mjs';
 
-const manifest = { selectedCount: 2, cvIdSetSha256: 'c'.repeat(64),
+const manifest = { page: 1, selectedCount: 2, cvIdSetSha256: 'c'.repeat(64),
   files: { excel: { sha256: 'a'.repeat(64), sizeBytes: 120 }, pdfArchive: { sha256: 'b'.repeat(64), sizeBytes: 500 } },
   verification: { exactMatch: true, zipCrcFailures: 0, pdfEntries: 2 } };
-const page = { page: 1, manifest };
+const page = { page: 1, count: 2, cvIdSetSha256: manifest.cvIdSetSha256, manifest };
 const receipt = { status: 'uploaded', page: 1, manifestSha256: 'd'.repeat(64),
-  excelSha256: 'a'.repeat(64), pdfSha256: 'b'.repeat(64), remoteBatch: '/incoming/local-ego-test/batch-0001' };
+  excelSha256: 'a'.repeat(64), pdfSha256: 'b'.repeat(64), remoteBatch: '/opt/bayt-intelligence/data/incoming/local-ego-test/batch-0001' };
 
 test('only a verified complete-page upload receipt becomes a 108 checkpoint', () => {
   assert.equal(checkpointInput(page, receipt).pdfEntries, 2);
@@ -40,15 +40,52 @@ test('a prepared run blocks a new claim even when status.json was not written', 
 
 test('a job with an existing registered search is rejected before a fresh Bayt search', () => {
   assert.doesNotThrow(() => assertNewSearchAllowed({ searchId: null }));
-  assert.throws(() => assertNewSearchAllowed({ searchId: 'existing-search' }),
+  assert.throws(() => assertNewSearchAllowed({ searchId: 'CTsNqMVJ' }),
     /EXISTING_SEARCH_ID_REQUIRES_CHECKPOINT_RESUME/);
 });
 
+test('checkpoint resume requires the same job, run, search, pages and no uncertain download', () => {
+  const searchSpec = { schemaVersion: 2, keyword: 'logistics' };
+  const limits = { maxPages: 2 };
+  const job = { id: 'job-a', searchId: 'search-a', searchSpec, limits,
+    pages: [{ page: 1, selectedCount: 2, cvIdSetSha256: manifest.cvIdSetSha256,
+      excelSha256: manifest.files.excel.sha256, pdfSha256: manifest.files.pdfArchive.sha256,
+      remoteBatch: receipt.remoteBatch }] };
+  const state = { schemaVersion: 2, runId: 'local-ego-test', queueJobId: job.id,
+    searchId: job.searchId, searchSpec, limits, status: 'safety_stopped', phase: 'stopped',
+    stopReason: 'NEXT_PAGE_OVERLAP', intent: null, deadlineAt: '2100-01-01T00:00:00.000Z',
+    pages: [{ ...page, count: 2 }], current: { page: 1, ids: ['1', '2'] }, seenIds: ['1', '2'] };
+  assert.doesNotThrow(() => assertResumeClaim(job, state.runId, state, [receipt]));
+  assert.throws(() => assertResumeClaim(job, state.runId, { ...state, intent: { format: 'pdf' } }, [receipt]), /IDENTITY_INVALID/);
+  assert.throws(() => assertResumeClaim(job, state.runId, { ...state, searchId: 'other' }, [receipt]), /IDENTITY_INVALID/);
+  assert.throws(() => assertResumeClaim(job, state.runId, { ...state, seenIds: ['1', '1'] }, [receipt]), /PAGES_INVALID/);
+  assert.throws(() => assertResumeClaim(job, state.runId, state, [{ ...receipt, excelSha256: 'e'.repeat(64) }]), /RECEIPT_INVALID/);
+  // Expired runs may be finalized from their existing pages, never restarted with a new deadline.
+  assert.doesNotThrow(() => assertResumeClaim(job, state.runId, { ...state, deadlineAt: '2020-01-01T00:00:00Z' }, [receipt]));
+});
+
 test('startup challenge keeps Ray evidence and requests user verification instead of generic form failure', () => {
-  assert.deepEqual(startSearchFailure(Error('BAYT_VERIFICATION_REQUIRED rayId=0123456789abcdef')),
-    { code: 'BAYT_VERIFICATION_REQUIRED', message: '官网验证需要人工接手；Ray ID 0123456789abcdef',
-      rayId: '0123456789abcdef' });
+  assert.deepEqual(startSearchFailure(Error('BAYT_VERIFICATION_REQUIRED rayId=a430b2c99ce81fba')),
+    { code: 'BAYT_VERIFICATION_REQUIRED', message: '官网验证需要人工接手；Ray ID a430b2c99ce81fba',
+      rayId: 'a430b2c99ce81fba' });
   assert.equal(startSearchFailure(Error('FORM_CONTROL_HIDDEN')).code, 'SEARCH_FORM_UNVERIFIED');
+  assert.equal(startSearchFailure(Error('EGO_USER_CONTROL_REQUIRED')).code, 'BAYT_VERIFICATION_REQUIRED');
+});
+
+test('lease renewals continue during a long recovery action and stop after it ends', async () => {
+  let calls = 0;
+  await withLeaseHeartbeat({ jobId: 'isolated', leaseToken: 'test' }, () => new Promise(resolve => setTimeout(resolve, 40)),
+    async () => { calls++; }, 5);
+  assert.ok(calls >= 2);
+  const after = calls;
+  await new Promise(resolve => setTimeout(resolve, 15));
+  assert.equal(calls, after);
+});
+
+test('lost collection-complete reply is recovered even while upload is still pending', () => {
+  const active = { jobId: 'a', searchId: 's', checkpointedPages: [] };
+  assert.equal(terminalAcknowledged(active, { status: 'completed', pages: [page] },
+    { id: 'a', searchId: 's', status: 'completed', completedPages: 0, collectedPages: 1, collectionFinishedAt: 'now' }), true);
 });
 
 test('verification handoff marker blocks further queue claims until explicitly cleared', async t => {
@@ -121,4 +158,14 @@ test('a temporary registration failure leaves prepared run unactivated for the s
   assert.equal(await bootstrapRun(active, state, handlers), true);
   assert.deepEqual(calls, ['register', 'register', 'activate', 'rebind']);
   assert.equal(active.needsRebind, false);
+});
+
+test('lost terminal acknowledgement releases only the exact verified completed run', () => {
+  const active = { jobId: 'job-a', searchId: 'search-a', checkpointedPages: [1] };
+  const local = { status: 'completed', pages: [{ page: 1 }] };
+  const remote = { id: 'job-a', searchId: 'search-a', status: 'completed', completedPages: 1 };
+  assert.equal(terminalAcknowledged(active, local, remote), true);
+  assert.equal(terminalAcknowledged(active, local, { ...remote, searchId: 'other' }), false);
+  assert.equal(terminalAcknowledged(active, local, { ...remote, completedPages: 0 }), false);
+  assert.equal(terminalAcknowledged(active, { ...local, status: 'running' }, remote), false);
 });

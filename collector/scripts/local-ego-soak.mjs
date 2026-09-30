@@ -159,18 +159,21 @@ function challengeEvidence(raw, message = '') {
     at: response?.at || parts?.[1] || new Date().toISOString(),
     status: response?.status || Number(parts?.[2]) || 403,
     rayId: response?.rayId || parts?.[3] || null,
+    path: response?.path || null,
   };
 }
 
 async function awaitVerification(root, state, evidence, reason) {
   const firstNotice = !state.challenge?.notifiedAt;
+  state.resumePhase = state.phase;
+  state.resumeNextActionAt = state.nextActionAt;
   state.status = 'awaiting_verification'; state.nextActionAt = null;
   state.stopReason = reason;
   state.challenge = { ...evidence, attemptedNormalLoad: true,
     notifiedAt: state.challenge?.notifiedAt || new Date().toISOString() };
   await save(root, state);
   await appendLog(root, 'awaiting_verification', { page: state.current.page + 1,
-    responseAt: evidence.at, status: evidence.status, rayId: evidence.rayId, reason });
+    responseAt: evidence.at, status: evidence.status, rayId: evidence.rayId, path: evidence.path, reason });
   if (firstNotice) await notifyVerification();
   try { await ego({ action: 'handoff', spaceId: state.spaceId }); }
   catch (error) { await appendLog(root, 'ego_handoff_error', { code: String(error?.message || error).slice(0, 120) }); }
@@ -301,6 +304,7 @@ async function commitPdf(root, state) {
     Date.parse(state.current.excelAt) + jitter(POLICY.pageMinMs, POLICY.pageMaxMs),
     Date.now() + jitter(POLICY.exportMinMs, POLICY.exportMaxMs),
   )).toISOString();
+  state.browserCooldownUntil = state.nextActionAt;
   state.failures = 0;
   state.rateLimits = 0;
   await save(root, state);
@@ -321,22 +325,24 @@ async function reconcileIntent(root, state) {
   } catch { return false; }
 }
 
+export function finishIfReady(state, now = Date.now()) {
+  if (state.intent) return false;
+  const limit = state.phase === 'next' && state.limits &&
+    ((state.limits.maxPages && state.pages.length >= state.limits.maxPages) ||
+      (state.limits.targetCount && state.seenIds.length >= state.limits.targetCount));
+  const expired = ['next', 'excel_prepare'].includes(state.phase) && deadlineReached(state.deadlineAt, now);
+  if (limit || expired) {
+    if (state.phase === 'next' && state.nextActionAt) state.browserCooldownUntil = state.nextActionAt;
+    state.status = 'completed'; state.phase = 'finished'; state.nextActionAt = null;
+    return true;
+  }
+  return false;
+}
+
 async function step(root, state) {
   const current = state.current;
-  if (state.phase === 'next' && state.limits &&
-    ((state.limits.maxPages && state.pages.length >= state.limits.maxPages) ||
-      (state.limits.targetCount && state.seenIds.length >= state.limits.targetCount))) {
-    state.status = 'completed'; state.phase = 'finished'; state.nextActionAt = null;
-    await save(root, state); await appendLog(root, 'queue_job_limits_reached', { pages: state.pages.length, count: state.seenIds.length });
-    return;
-  }
-  // Do not start a fresh page once the 24-hour window has elapsed. An XLS
-  // already started before the deadline may still receive its matching PDF.
-  if (state.phase === 'excel_prepare' && deadlineReached(state.deadlineAt)) {
-    state.status = 'completed'; state.phase = 'finished'; state.nextActionAt = null;
-    await save(root, state);
-    await appendLog(root, 'duration_completed', { total: state.seenIds.length });
-    return;
+  if (finishIfReady(state)) {
+    await save(root, state); await appendLog(root, 'collection_completed', { pages: state.pages.length, count: state.seenIds.length }); return;
   }
   const common = { spaceId: state.spaceId, searchId: state.searchId, keyword: state.keyword, schemaVersion: state.schemaVersion,
     page: current.page, ids: current.ids };
@@ -384,6 +390,10 @@ async function step(root, state) {
 }
 
 async function stop(root, state, reason) {
+  if (state.phase !== 'stopped') {
+    state.resumePhase = state.phase;
+    state.resumeNextActionAt = state.nextActionAt;
+  }
   state.status = 'safety_stopped'; state.phase = 'stopped'; state.stopReason = reason;
   state.nextActionAt = null;
   await save(root, state);
@@ -396,6 +406,10 @@ async function handleError(root, state, error) {
   if (state.intent) {
     if (await reconcileIntent(root, state)) return;
     await stop(root, state, 'UNCERTAIN_DOWNLOAD_RESULT');
+    return;
+  }
+  if (/EGO_USER_CONTROL_REQUIRED|BAYT_LOGIN_REQUIRED/.test(message)) {
+    await awaitVerification(root, state, { at: new Date().toISOString(), status: null, rayId: null }, 'EGO_USER_CONTROL_REQUIRED');
     return;
   }
   if (/BAYT_RESULTS_HTTP_403|BAYT_CAPTCHA|NEXT_PAGE_OVERLAP|NEXT_PAGE_VALIDATION_FAILED/.test(message)) {
@@ -465,34 +479,79 @@ async function retire(root) {
   await appendLog(root, 'run_retired_by_admin', { pages: state.pages.length, verifiedResumes: state.seenIds.length });
 }
 
+export function resumePhase(state) {
+  if (state.intent) throw Error('UNCERTAIN_PREVIOUS_DOWNLOAD');
+  const saved = state.phase === 'stopped' ? state.resumePhase : state.phase;
+  // A confirmation modal itself is not a download intent. Reopen it only after identity checks.
+  if (['next', 'excel_prepare', 'pdf_prepare'].includes(saved)) return saved;
+  if (saved === 'excel_confirm') return 'excel_prepare';
+  if (saved === 'pdf_confirm') return 'pdf_prepare';
+  if (state.current?.pdf && state.pages.at(-1)?.page === state.current.page) return 'next';
+  if (state.current?.excel && !state.current.pdf) return 'pdf_prepare';
+  if (!state.current?.excel && !state.current?.pdf && state.current?.page === state.pages.length + 1) return 'excel_prepare';
+  throw Error('RECOVERY_PHASE_UNPROVEN');
+}
+
+function assertRecoverable(state, userVerified) {
+  if (state.intent) throw Error('UNCERTAIN_PREVIOUS_DOWNLOAD');
+  if (state.status === 'awaiting_verification' && !userVerified) throw Error('USER_VERIFICATION_REQUIRED');
+  if (!['awaiting_verification', 'safety_stopped', 'operator_stopped'].includes(state.status) ||
+    /RETIRED|UNCERTAIN|MISMATCH|CRC|MAPPING|INVALID/.test(state.stopReason || '')) throw Error('RECOVERY_STATE_NOT_SUPPORTED');
+}
+
 async function recover(root, userVerified = false) {
   root = path.resolve(root || '');
   if (!root.startsWith(base + path.sep)) throw Error('RUN_ROOT_OUTSIDE_LOCAL_RUNS');
   const state = JSON.parse(await fsp.readFile(statePath(root), 'utf8'));
-  if (deadlineReached(state.deadlineAt)) throw Error('RUN_DEADLINE_REACHED');
-  if (state.intent) throw Error('UNCERTAIN_PREVIOUS_DOWNLOAD');
+  assertRecoverable(state, userVerified);
   await verifyCompletedPages(root, state);
-  if (userVerified) {
-    if (state.status !== 'awaiting_verification') throw Error('NOT_AWAITING_VERIFICATION');
-  } else if (state.status !== 'safety_stopped' || !['NEXT_PAGE_OVERLAP', 'CROSS_PAGE_CV_ID_OVERLAP'].includes(state.stopReason)) {
-    throw Error('RECOVERY_STATE_NOT_SUPPORTED');
+  const phase = resumePhase(state);
+  if (phase === 'pdf_prepare') {
+    const file = path.join(batchDir(root, state.current.page), 'resumes.xls');
+    const actual = await evidence(file);
+    const ids = (await parseExcelExport(file)).map(row => row.cvId);
+    if (actual.sha256 !== state.current.excel.sha256 || !sameSet(ids, state.current.ids)) throw Error('PARTIAL_XLS_MISMATCH');
   }
-  const page = await ego({ action: userVerified ? 'resumeInspect' : 'inspectRaw', spaceId: state.spaceId });
-  if (freshNextPage(page, state)) { await acceptNextPage(root, state, page); return; }
-  if (userVerified) {
-    if (page.warning || page.page !== state.current.page ||
-      !sameSet(page.ids, state.current.ids)) {
-      await awaitVerification(root, state, challengeEvidence(page), 'VERIFICATION_NOT_CONFIRMED'); return;
-    }
+  state.phase = phase;
+  state.nextActionAt = state.resumeNextActionAt || state.browserCooldownUntil ||
+    (phase === 'pdf_prepare' ? new Date(Date.parse(state.current.excelAt) + POLICY.exportMaxMs).toISOString() : new Date().toISOString());
+  if (finishIfReady(state)) { await save(root, state); await appendLog(root, 'expired_run_finalized'); return; }
+  let page = await ego({ action: userVerified ? 'resumeInspect' : 'inspectRaw', spaceId: state.spaceId });
+  if (!page.warning && page.host === 'www.bayt.com' &&
+    (page.path === '/en/employers/cv-search/' || (page.path === '/en/employers/cv-search/listing/' && page.searchId !== state.searchId)))
+    page = await ego({ action: 'restoreListing', spaceId: state.spaceId, searchId: state.searchId, page: state.current.page });
+  if (page.warning === 'RATE_LIMIT') throw Error('BAYT_RATE_LIMIT');
+  if (page.warning === 'LOGIN_REQUIRED') throw Error('BAYT_LOGIN_REQUIRED');
+  if (phase === 'next' && !page.warning && freshNextPage(page, state)) {
+    const nextAt = state.nextActionAt;
+    await acceptNextPage(root, state, page);
+    state.nextActionAt = nextAt;
+    await fsp.unlink(path.join(root, 'stop-requested.json')).catch(error => { if (error.code !== 'ENOENT') throw error; });
+    await save(root, state); return;
+  }
+  if (!page.warning && page.page === state.current.page && sameSet(page.ids, state.current.ids)) {
     assertListing(page, state, state.current.page, state.current.ids);
-    state.status = 'running'; state.phase = 'next'; state.nextActionAt = new Date().toISOString();
+    state.status = 'running';
     state.stopReason = null; state.challenge = null;
-    await save(root, state); await appendLog(root, 'user_verification_confirmed'); return;
+    // The resume request explicitly acknowledges an earlier pause request.
+    await fsp.unlink(path.join(root, 'stop-requested.json')).catch(error => { if (error.code !== 'ENOENT') throw error; });
+    await save(root, state); await appendLog(root, 'checkpoint_resume_verified', { phase }); return;
   }
   if (page.warning === 'RESULTS_HTTP_403' || page.warning === 'CAPTCHA') {
-    state.phase = 'next'; await handleChallenge(root, state, page); return;
+    await awaitVerification(root, state, challengeEvidence(page), 'VERIFICATION_NOT_CONFIRMED'); return;
   }
   throw Error('RECOVERY_PAGE_NOT_VERIFIED');
+}
+
+async function verifyResume(root, jobId) {
+  root = path.resolve(root || '');
+  if (!root.startsWith(base + path.sep)) throw Error('RUN_ROOT_OUTSIDE_LOCAL_RUNS');
+  const state = JSON.parse(await fsp.readFile(statePath(root), 'utf8'));
+  if (state.schemaVersion !== 2 || state.queueJobId !== jobId ||
+    state.runId !== path.basename(root) || state.intent) throw Error('CHECKPOINT_RESUME_NOT_SAFE');
+  assertRecoverable(state, true);
+  resumePhase(state);
+  await verifyCompletedPages(root, state);
 }
 
 async function rebindSupervisor(root, supervisorPid) {
@@ -511,17 +570,29 @@ async function rebindSupervisor(root, supervisorPid) {
 
 async function waitUntil(root, state) {
   while (!shutdownRequested && state.status === 'running' && Date.now() < Date.parse(state.nextActionAt)) {
+    if (finishIfReady(state)) { await save(root, state); return; }
     if (state.supervisorPid) {
       try { process.kill(state.supervisorPid, 0); }
       catch { await stop(root, state, 'QUEUE_SUPERVISOR_LOST'); return; }
     }
+    if (!(await checkControlLease(root, state))) return;
     if (fs.existsSync(path.join(root, 'stop-requested.json'))) {
+      state.resumePhase = state.phase; state.resumeNextActionAt = state.nextActionAt;
       state.status = 'operator_stopped'; state.phase = 'stopped'; state.stopReason = 'LOCAL_STOP_REQUESTED';
       await save(root, state); return;
     }
     await heartbeat(root, state);
     await sleep(Math.min(30_000, Date.parse(state.nextActionAt) - Date.now()));
   }
+}
+
+async function checkControlLease(root, state) {
+  if (state.schemaVersion !== 2) return true;
+  let confirmedAt;
+  try { confirmedAt = JSON.parse(await fsp.readFile(path.join(root, 'control-lease.json'), 'utf8')).confirmedAt; }
+  catch { /* A missing control-plane acknowledgement is not a valid lease. */ }
+  if (confirmedAt && Date.now() - Date.parse(confirmedAt) < 90_000) return true;
+  await stop(root, state, 'LOCAL_LEASE_HEARTBEAT_LOST'); return false;
 }
 
 async function run(root) {
@@ -551,9 +622,17 @@ async function run(root) {
       await stop(root, state, 'UNCERTAIN_PREVIOUS_DOWNLOAD'); return;
     }
     while (!shutdownRequested && state.status === 'running') {
+      if (finishIfReady(state)) { await save(root, state); await appendLog(root, 'collection_completed', { pages: state.pages.length }); break; }
+      // A due action must also observe pause; waitUntil alone only checks while sleeping.
+      if (fs.existsSync(path.join(root, 'stop-requested.json'))) {
+        state.resumePhase = state.phase; state.resumeNextActionAt = state.nextActionAt;
+        state.status = 'operator_stopped'; state.phase = 'stopped'; state.stopReason = 'LOCAL_STOP_REQUESTED';
+        await save(root, state); break;
+      }
       await waitUntil(root, state);
       if (shutdownRequested) break;
       if (state.status !== 'running') break;
+      if (!(await checkControlLease(root, state))) break;
       if (state.supervisorPid) {
         try { process.kill(state.supervisorPid, 0); }
         catch { await stop(root, state, 'QUEUE_SUPERVISOR_LOST'); break; }
@@ -576,6 +655,7 @@ if (invokedDirectly) {
     else if (command === 'run') await run(argument);
     else if (command === 'recover') await recover(argument);
     else if (command === 'resume-verified') await recover(argument, true);
+    else if (command === 'verify-resume') await verifyResume(argument, String(extra || ''));
     else if (command === 'rebind-supervisor') await rebindSupervisor(argument, Number(extra));
     else if (command === 'activate-run') await activateRun(argument, String(extra || ''));
     else if (command === 'retire') await retire(argument);

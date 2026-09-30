@@ -1,6 +1,8 @@
 // Runs inside `ego-browser nodejs`. UI actions use only the documented Ego API.
 const cfg = JSON.parse(globalThis.BAYT_EGO_ACTION_JSON || '{}');
-const task = cfg.action === 'resumeInspect' ? await takeOverTaskSpace(cfg.spaceId) : await taskSpace(cfg.spaceId);
+let task = await taskSpace(cfg.spaceId);
+if (cfg.action === 'resumeInspect' && task.ownership !== 'agent') task = await takeOverTaskSpace(cfg.spaceId);
+if (task.ownership !== 'agent') throw Error('EGO_USER_CONTROL_REQUIRED');
 const page = task.page('p1');
 
 function browserState() {
@@ -16,18 +18,28 @@ function browserState() {
     .filter(element => /^\d+$/.test(element.name));
   // Bayt can keep the old candidates visible after a rejected AJAX request.
   // The page number alone is therefore not proof that the next page loaded.
-  const lastResultsResponse = performance.getEntriesByType('resource')
-    .filter(entry => /\/v6\/cvSearch\/[^/]+\/results\/?(?:\?|$)/.test(entry.name))
-    .at(-1);
-  const resultResponse = lastResultsResponse ? {
-    at: new Date(performance.timeOrigin + lastResultsResponse.startTime).toISOString(),
-    status: lastResultsResponse.responseStatus || null,
-    rayId: lastResultsResponse.serverTiming?.find(item => item.name.toLowerCase() === 'chlray')?.description || null,
+  const latest = new Map();
+  for (const entry of performance.getEntriesByType('resource')) {
+    const url = new URL(entry.name, location.href);
+    if (url.origin === location.origin && (/^\/v6\/cvSearch\/[^/]+\/results\/?$/.test(url.pathname) ||
+      url.pathname === '/v6/employer/myAccount/employerPreferences')) latest.set(url.pathname, entry);
+  }
+  const blockedResponse = [...latest.values()].filter(entry => [401,403,429].includes(entry.responseStatus))
+    .sort((a, b) => a.startTime - b.startTime).at(-1);
+  const lastResultsResponse = [...latest.values()]
+    .filter(entry => /\/results\/?$/.test(new URL(entry.name, location.href).pathname))
+    .sort((a, b) => a.startTime - b.startTime).at(-1);
+  const response = blockedResponse || lastResultsResponse;
+  const resultResponse = response ? {
+    at: new Date(performance.timeOrigin + response.startTime).toISOString(),
+    status: response.responseStatus || null,
+    path: new URL(response.name, location.href).pathname,
+    rayId: response.serverTiming?.find(item => item.name.toLowerCase() === 'chlray')?.description || null,
   } : null;
   let warning = null;
-  if (lastResultsResponse?.responseStatus === 403) warning = 'RESULTS_HTTP_403';
-  else if (lastResultsResponse?.responseStatus === 429) warning = 'RATE_LIMIT';
-  else if (lastResultsResponse?.responseStatus === 401) warning = 'LOGIN_REQUIRED';
+  if (response?.responseStatus === 403) warning = 'RESULTS_HTTP_403';
+  else if (response?.responseStatus === 429) warning = 'RATE_LIMIT';
+  else if (response?.responseStatus === 401) warning = 'LOGIN_REQUIRED';
   else if (/verify you are human|confirm you are human|complete the captcha|cloudflare|security verification/i.test(body)) warning = 'CAPTCHA';
   else if (/too many requests|unusually high search activity|rate limit|try again in a few minutes/i.test(body)) warning = 'RATE_LIMIT';
   else if (/session (?:has )?expired|sign in to continue|log in to continue/i.test(body) ||
@@ -215,6 +227,32 @@ let result;
 if (cfg.action === 'inspect') result = await inspect();
 else if (cfg.action === 'inspectRaw') result = await page.evaluate(browserState);
 else if (cfg.action === 'resumeInspect') result = await page.evaluate(browserState);
+else if (cfg.action === 'restoreListing') {
+  if (!/^[A-Za-z0-9_-]{4,200}$/.test(cfg.searchId || '')) throw Error('SEARCH_IDENTITY_CHANGED');
+  // Ordinary navigation to the already registered search, never a replay of the results API.
+  await page.goto(`https://www.bayt.com/en/employers/cv-search/listing/?searchId=${encodeURIComponent(cfg.searchId)}`);
+  result = await page.evaluate(browserState);
+  if (!result.warning && result.searchId === cfg.searchId && result.page !== cfg.page) {
+    const available = await page.evaluate(() => {
+      const el = document.querySelector('input[name=p]');
+      return !!el && !el.disabled && !el.readOnly && el.getBoundingClientRect().width > 0 && el.getBoundingClientRect().height > 0;
+    });
+    if (!available || !Number.isInteger(cfg.page) || cfg.page < 1) throw Error('RESTORE_PAGE_CONTROL_UNAVAILABLE');
+    const before = result.ids;
+    await page.fill('loc=css:input[name=p]', String(cfg.page));
+    await page.press('loc=css:input[name=p]', 'Enter');
+    try {
+      await page.waitForFunction(expected => {
+        const last = performance.getEntriesByType('resource').filter(e => /\/v6\/cvSearch\/[^/]+\/results/.test(e.name)).at(-1);
+        if ([401,403,429].includes(last?.responseStatus)) return true;
+        const ids = [...document.querySelectorAll('input[type=checkbox][name]')].filter(e => /^\d+$/.test(e.name)).map(e => e.name);
+        return Number(document.querySelector('input[name=p]')?.value) === expected.page && ids.length > 0 &&
+          (ids.length !== expected.before.length || ids.some(id => !expected.before.includes(id)));
+      }, { page: cfg.page, before }, { timeout: 45_000 });
+    } catch { /* The caller still requires the exact saved CV_ID set before proceeding. */ }
+    result = await page.evaluate(browserState);
+  }
+}
 else if (cfg.action === 'handoff') { await task.handOff(); result = { handedOff: true }; }
 else if (cfg.action === 'challenge') result = await challenge();
 else if (cfg.action === 'prepare') result = await prepare(cfg.format);

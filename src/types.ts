@@ -339,6 +339,14 @@ export interface CollectorPageCheckpoint {
 }
 
 export interface CollectionQueueJob {
+  collectedPages?: number;
+  collectedCount?: number;
+  displayedCount?: number;
+  collectionFinishedAt?: string | null;
+  phase?: string | null;
+  nextActionAt?: string | null;
+  deliveryError?: string | null;
+  resumeMode?: "new_search" | "checkpoint" | "review";
   id: string;
   templateId: string | null;
   scheduleId: string | null;
@@ -370,6 +378,9 @@ export interface CollectionQueueJob {
 }
 
 export interface CollectorAgentState {
+  waitReason?: string | null;
+  nextActionAt?: string | null;
+  verificationId?: string | null;
   id: string;
   name: string;
   version: string;
@@ -377,10 +388,11 @@ export interface CollectorAgentState {
   lastHeartbeatAt: string;
   currentJobId: string | null;
   chromeReady: boolean;
-  loginState: "unknown" | "logged_in" | "login_required";
+  loginState: "unknown" | "logged_in" | "login_required" | "verification_required";
 }
 
 export interface CollectorControlState {
+  browserNextActionAt?: string | null;
   globallyPaused: boolean;
   pauseCode: string | null;
   pauseMessage: string | null;

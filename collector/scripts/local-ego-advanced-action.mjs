@@ -1,6 +1,6 @@
 // Runs inside `ego-browser nodejs`. Only ordinary, visible Bayt form controls are used.
 const cfg = JSON.parse(globalThis.BAYT_EGO_ACTION_JSON || '{}');
-const task = await taskSpace(cfg.spaceId);
+const task = cfg.action === 'verifySession' ? await takeOverTaskSpace(cfg.spaceId) : await taskSpace(cfg.spaceId);
 if (task.ownership !== 'agent') throw Error('EGO_USER_CONTROL_REQUIRED');
 const page = task.page('p1');
 const SEARCH_URL = 'https://www.bayt.com/en/employers/cv-search/';
@@ -415,7 +415,59 @@ async function startSearch() {
     ids: [...document.querySelectorAll('input[type=checkbox][name]')].filter(element => /^\d+$/.test(element.name)).map(element => element.name) })), actualFilterLabels };
 }
 
-const result = cfg.action === 'catalog' ? await discoverCatalog() : cfg.action === 'startSearch' ? await startSearch() :
+async function verifySession() {
+  try {
+    await checkSearchResponse();
+    const verified = await page.evaluate(() => {
+      const visible = el => el.getBoundingClientRect().width > 0 && el.getBoundingClientRect().height > 0;
+      const body = document.body?.innerText || '';
+      if (location.hostname !== 'www.bayt.com' || !['/en/employers/cv-search/', '/en/employers/cv-search/listing/'].includes(location.pathname) ||
+        /verify you are human|just a moment|security verification|complete the captcha|cloudflare|session expired/i.test(body) ||
+        [...document.querySelectorAll('input[type=password]')].some(visible)) return false;
+      const search = document.querySelector('#searchBar');
+      // Loaded searches replace "Search CVs" with a count (including "0 CVs").
+      // Advanced filters also carries a badge and icon; neither means a challenge.
+      const formReady = !!search && visible(search) && [...document.querySelectorAll('a,button')].some(el => visible(el) &&
+        /^(?:Search CVs|[\d,]+ CVs|Advanced filters(?: \d+)?)$/i.test((el.innerText || '')
+          .replace(/[\uE000-\uF8FF]/g, '').replace(/\s+/g, ' ').trim()));
+      return formReady ||
+        [...document.querySelectorAll('input[type=checkbox][name]')].some(el => /^\d+$/.test(el.name));
+    });
+    if (!verified) await task.handOff();
+    return { verified };
+  } catch (error) { await task.handOff(); throw error; }
+}
+
+async function checkSearchResponse() {
+  const problem = await page.evaluate(() => {
+    const body = document.body?.innerText || '';
+    // The shell can render normally while its preferences request is challenged.
+    // Consider the latest response per required endpoint; unrelated 403s and a
+    // recovered earlier failure must not keep a healthy session blocked.
+    const latest = new Map();
+    for (const entry of performance.getEntriesByType('resource')) {
+      const url = new URL(entry.name, location.href);
+      if (url.origin === location.origin && (/^\/v6\/cvSearch\/[^/]+\/results\/?$/.test(url.pathname) ||
+        url.pathname === '/v6/employer/myAccount/employerPreferences')) latest.set(url.pathname, entry);
+    }
+    const last = [...latest.values()].filter(e => [401,403,429].includes(e.responseStatus))
+      .sort((a, b) => a.startTime - b.startTime).at(-1);
+    const visiblePassword = [...document.querySelectorAll('input[type=password]')].some(e => e.getBoundingClientRect().width > 0);
+    return { status: last?.responseStatus || null, verification: /verify you are human|just a moment|security verification|complete the captcha/i.test(body),
+      login: visiblePassword, rayId: last?.serverTiming?.find(e => e.name.toLowerCase() === 'chlray')?.description ||
+        body.match(/Ray ID:\s*([a-f0-9]{8,64})/i)?.[1] || null };
+  });
+  if (problem.status === 429) throw Error('BAYT_429');
+  if ([401,403].includes(problem.status) || problem.verification || problem.login)
+    throw Error(`BAYT_VERIFICATION_REQUIRED${problem.rayId ? ` rayId=${problem.rayId}` : ''}`);
+}
+
+async function guardedStartSearch() {
+  try { const result = await startSearch(); await checkSearchResponse(); return result; }
+  catch (error) { await checkSearchResponse(); throw error; }
+}
+
+const result = cfg.action === 'verifySession' ? await verifySession() : cfg.action === 'catalog' ? await discoverCatalog() : cfg.action === 'startSearch' ? await guardedStartSearch() :
   cfg.action === 'handoff' ? (await task.handOff(), { handedOff: true }) : null;
 if (!result) throw Error('UNKNOWN_ADVANCED_ACTION');
 console.log(`BAYT_EGO_RESULT=${JSON.stringify(result)}`);

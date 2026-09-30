@@ -15,9 +15,9 @@ const catalog: CollectorFilterCatalog = {
   ],
   sorts: [{ key: "recent", label: "Most recently updated" }],
   advanced: { keywordModes: [{ key: "any", label: "Any words" }, { key: "exact", label: "Exact order" }],
-    nameSupported: true, locations: [{ key: "jordan", label: "Jordan", cities: [{ key: "amman", label: "Amman" }] }],
-    jobRoles: [{ key: "engineering", label: "Engineering" }],
-    industries: [{ key: "software", label: "Software Services" }], exclusionSupported: true, reliable: true },
+    nameSupported: true, locations: [{ key: "syria", label: "Syria", cities: [{ key: "jisr", label: "Jisr ash Shughur" }] }],
+    jobRoles: [{ key: "logistics", label: "Logistics and Transportation" }],
+    industries: [{ key: "nonprofit", label: "Non-profit Organization" }], exclusionSupported: true, reliable: true },
 };
 const template: CollectorSearchTemplate = {
   id: "template-1", name: "软件工程师", searchSpec: { schemaVersion: 2, keyword: "Software Engineer", keywordMode: "any", filterSchemaVersion: catalog.version,
@@ -68,7 +68,7 @@ test("采集页展示本机Ego高级目录、模板与串行队列并能直接�
   expect(body.clientRequestId).toBeTruthy();
   expect(new Headers(request?.[1]?.headers).has("X-Collector-Operator")).toBe(false);
   expect(new Headers(request?.[1]?.headers).get("X-Requested-With")).toBe("Bayt-Intelligence");
-  fireEvent.change(screen.getByPlaceholderText("候选人姓氏"), { target: { value: "Example-Surname" } });
+  fireEvent.change(screen.getByPlaceholderText("候选人姓氏"), { target: { value: "al-Turkistani" } });
   expect(screen.getByText(/官网姓名筛选不接受数字或特殊字符/)).toBeInTheDocument();
   expect(screen.getAllByRole("button", { name: "加入队列" })[0]).toBeDisabled();
   rendered.unmount(); queryClient.clear();
@@ -97,4 +97,49 @@ test("安全暂停可由已登录页面单击解除并保留审计原因", async
   expect(confirm).not.toHaveBeenCalled();
   rendered.unmount(); queryClient.clear();
   prompt.mockRestore(); confirm.mockRestore();
+});
+
+test("本机等待验证时不显示队列正常，已有搜索只提供核验续跑", async () => {
+  const checkpoint = { ...job, status: "safety_stopped" as const, queuePosition: null, resumeMode: "checkpoint" as const,
+    searchId: "search-1", completedPages: 1, errorCode: "SEARCH_FORM_UNVERIFIED" };
+  vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+    const url = String(input);
+    const payload = url.endsWith("/filter-catalog") ? { catalog, syncRequest: null }
+      : url.endsWith("/search-templates") ? { items: [] }
+        : url.endsWith("/jobs") ? { items: [checkpoint], control: { globallyPaused: false, pauseCode: null,
+          pauseMessage: null, pausedAt: null, runningJobId: null, queuedCount: 0, dailyExportedCount: 0, dailyLimit: 500 },
+          agents: [{ id: "local-ego-test", name: "本机 Ego Agent", version: "2", status: "online",
+            lastHeartbeatAt: new Date().toISOString(), currentJobId: null, chromeReady: false, loginState: "verification_required" }] }
+          : { items: [] };
+    return new Response(JSON.stringify(payload), { status: 200, headers: { "content-type": "application/json" } });
+  }));
+  const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  const rendered = render(<QueryClientProvider client={queryClient}><FluentProvider theme={appTheme}><MemoryRouter><CollectorPage /></MemoryRouter></FluentProvider></QueryClientProvider>);
+  expect(await screen.findByText("等待 Bayt 人工验证")).toBeInTheDocument();
+  expect(screen.getByRole("alert")).toHaveTextContent("请先在 Bayt 官网完成验证");
+  expect(screen.getByRole("button", { name: "已完成官网验证，继续" })).toBeDisabled();
+  expect(screen.getByRole("button", { name: "核验续跑" })).toBeInTheDocument();
+  expect(screen.queryByText("串行队列正常")).not.toBeInTheDocument();
+  rendered.unmount(); queryClient.clear();
+});
+
+test("明确验证按钮绑定当前标记，提交后不顺带解除全局暂停", async () => {
+  const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    const payload = url.endsWith("/filter-catalog") ? { catalog, syncRequest: null }
+      : url.endsWith("/jobs") ? { items: [], control: { globallyPaused: true, queuedCount: 0 },
+        agents: [{ id: "local-ego-test", name: "Agent", status: "online", loginState: "verification_required", verificationId: "current-marker", lastHeartbeatAt: new Date().toISOString() }] }
+        : init?.method === "POST" ? { id: "request-one", status: "pending" } : { items: [] };
+    return new Response(JSON.stringify(payload), { status: 200, headers: { "content-type": "application/json" } });
+  });
+  vi.stubGlobal("fetch", fetchMock);
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
+  const rendered = render(<QueryClientProvider client={client}><FluentProvider theme={appTheme}><MemoryRouter><CollectorPage /></MemoryRouter></FluentProvider></QueryClientProvider>);
+  const button = await screen.findByRole("button", { name: "已完成官网验证，继续" });
+  fireEvent.click(button);
+  await waitFor(() => expect(fetchMock.mock.calls.some(([url, init]) => String(url).endsWith("/verification") && init?.method === "POST")).toBe(true));
+  const call = fetchMock.mock.calls.find(([url, init]) => String(url).endsWith("/verification") && init?.method === "POST");
+  expect(JSON.parse(String(call?.[1]?.body))).toEqual({ agentId: "local-ego-test", verificationId: "current-marker" });
+  expect(fetchMock.mock.calls.some(([url]) => String(url).includes("acknowledge-safety"))).toBe(false);
+  rendered.unmount(); client.clear();
 });

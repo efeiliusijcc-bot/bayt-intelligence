@@ -50,6 +50,9 @@ export function CollectorPage() {
   const advanced = catalog?.advanced;
   const catalogReady = Boolean(catalog?.status === "ready" && catalog.agentId.startsWith("local-ego-") && advanced?.reliable &&
     Date.now() - Date.parse(catalog.synchronizedAt) <= 24 * 60 * 60 * 1000);
+  const localAgent = queueQuery.data?.agents.find((agent) => agent.id.startsWith("local-ego-"));
+  const verificationRequired = localAgent?.status === "online" && localAgent.loginState === "verification_required";
+  const queueReady = !queueQuery.data?.control.globallyPaused && localAgent?.status === "online" && localAgent.chromeReady;
   const nameSupportedByOfficial = !candidateName.trim() || /^[\p{L}\p{M}]+(?: [\p{L}\p{M}]+)*$/u.test(candidateName.trim());
 
   const refresh = async () => {
@@ -124,7 +127,7 @@ export function CollectorPage() {
   return <div className="page-stack collector-page">
     <div className="page-heading action-heading">
       <div><h1>采集任务</h1><p>108 管理搜索条件与串行队列；本机 Ego 执行官网搜索和整页导出，108 持续接收并展示。</p></div>
-      <Badge appearance="outline" color={queueQuery.data?.control.globallyPaused ? "danger" : "success"}>{queueQuery.data?.control.globallyPaused ? "全队列安全暂停" : "串行队列正常"}</Badge>
+      <Badge appearance="outline" color={queueQuery.data?.control.globallyPaused || verificationRequired ? "danger" : queueReady ? "success" : "warning"}>{queueQuery.data?.control.globallyPaused ? "全队列安全暂停" : verificationRequired ? "等待 Bayt 人工验证" : queueReady ? "串行队列可执行" : "Agent 未就绪，任务暂不领取"}</Badge>
     </div>
 
     <section className="collector-security-strip">
@@ -132,6 +135,7 @@ export function CollectorPage() {
       <div><strong>本站会话保护</strong><span>模板、任务和计划变更使用当前登录会话；Bayt 登录状态仅留在本机 Ego，不传给 108。</span></div>
     </section>
     {queueQuery.data?.control.globallyPaused && <div className="inline-error" role="alert"><strong>{queueQuery.data.control.pauseCode || "安全停止"}</strong><span>{queueQuery.data.control.pauseMessage || "检查停止原因后可恢复队列"}</span><span>发生于：{queueQuery.data.control.pausedAt ? new Date(queueQuery.data.control.pausedAt).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" }) : "未知"}（北京时间）。历史停止不会自动清除。</span></div>}
+    {verificationRequired && <div className="inline-error" role="alert"><strong>本机 Ego 等待人工验证</strong><span>请先在 Bayt 官网完成验证，再点击下方按钮。Agent 会核验当前页面；验证未通过时仍交由你操作，不会解除全局安全暂停。</span><Button disabled={mutation.isPending || !localAgent?.verificationId} onClick={() => localAgent?.verificationId && mutation.mutate(() => apiClient.confirmCollectorVerification(localAgent.id, localAgent.verificationId!))}>已完成官网验证，继续</Button></div>}
     {queueQuery.data?.control.globallyPaused && <Button size="small" appearance="outline" disabled={mutation.isPending} onClick={() =>
       mutation.mutate(() => apiClient.acknowledgeCollectorSafety(`已登录用户在采集任务页解除安全暂停：${queueQuery.data.control.pauseCode || "未指定原因"}`))
     }>解除全局安全暂停</Button>}
@@ -180,6 +184,7 @@ export function CollectorPage() {
     <section className="section-panel">
       <div className="section-heading"><div><h2>串行采集队列</h2><p>待执行任务可以调序或取消；运行任务只允许暂停。任何时刻最多一个任务持有租约。</p></div><div className="collector-queue-summary"><span>今日已导出 <strong>{queueQuery.data?.control.dailyExportedCount || 0}</strong>{queueQuery.data?.control.dailyLimit === null ? " / 不限" : ` / ${queueQuery.data?.control.dailyLimit ?? 500}`}</span><span>排队 <strong>{queueQuery.data?.control.queuedCount || 0}</strong></span></div></div>
       <AgentStrip agents={(queueQuery.data?.agents || []).filter((agent) => agent.id.startsWith("local-ego-"))} />
+      {localAgent?.waitReason && <p role="status">{queueWaitLabel(localAgent.waitReason)}{localAgent.nextActionAt ? `；预计 ${new Date(localAgent.nextActionAt).toLocaleString("zh-CN")} 后继续` : ""}</p>}
       {queueQuery.isPending ? <ProgressBar /> : queueQuery.isError ? <div className="inline-error">{queueQuery.error.message}<Button size="small" onClick={() => queueQuery.refetch()}>重试</Button></div> : <QueueTable jobs={queueQuery.data?.items || []} busy={mutation.isPending} action={(job, name) => mutation.mutate(() => apiClient.collectorJobAction(job.id, name))} />}
     </section>
 
@@ -216,7 +221,7 @@ function AdvancedFilterEditor({ catalog, name, setName, locations, setLocations,
           <Button size="small" type="button" onClick={() => setLocations(locations.filter((_, i) => i !== index))}>移除</Button></div>;
       })}<Button size="small" type="button" disabled={Boolean(approximate.trim()) || locations.length >= 8 || !advanced.locations.length}
         onClick={() => setLocations([...locations, { countryKey: "", cityKey: null }])}>添加地点</Button></div>
-      <label><span>无官网城市选项时的近似关键词</span><Input value={approximate} disabled={Boolean(locations.length)} onChange={(_, data) => setApproximate(data.value)} placeholder="例如未列出的地区名称；须单独入队" /><small>近似匹配，不等于精确地点；不能与精确地点合并发布。</small></label></div>
+      <label><span>无官网城市选项时的近似关键词</span><Input value={approximate} disabled={Boolean(locations.length)} onChange={(_, data) => setApproximate(data.value)} placeholder="例如 Badakhshan；须单独入队" /><small>近似匹配，不等于精确地点；不能与精确地点合并发布。</small></label></div>
     <div className="collector-role-grid">{multi("包含职能", advanced.jobRoles, includeRoles, setIncludeRoles)}{multi("排除职能", advanced.jobRoles, excludeRoles, setExcludeRoles, !advanced.exclusionSupported)}
       {multi("包含行业", advanced.industries, includeIndustries, setIncludeIndustries)}{multi("排除行业", advanced.industries, excludeIndustries, setExcludeIndustries, !advanced.exclusionSupported)}</div>
     {!advanced.exclusionSupported && <span className="collector-unsupported-note">官网排除控件未可靠确认，本次不能下发排除条件。</span>}
@@ -271,11 +276,43 @@ function TemplateCard({ template, catalog, disabled, onEdit, onCopy, onDelete, o
 
 function QueueTable({ jobs, busy, action }: { jobs: CollectionQueueJob[]; busy: boolean; action: (job: CollectionQueueJob, action: "pause" | "resume" | "cancel" | "move-up" | "move-down") => void }) {
   if (!jobs.length) return <div className="collector-empty">队列为空。</div>;
-  return <div className="data-table-wrap"><table className="data-table collector-queue-table"><thead><tr><th>排位</th><th>任务与条件</th><th>来源</th><th>状态</th><th>页进度</th><th>XLS / PDF</th><th>上传</th><th>搜索证据</th><th>操作</th></tr></thead><tbody>{jobs.map((job) => <tr key={job.id}><td>{job.queuePosition ? `#${job.queuePosition}` : activeStatuses.has(job.status) ? "执行中" : "完成"}</td><td><Link className="collector-job-link" to={`/collector/jobs/${encodeURIComponent(job.id)}`}>{job.name}</Link><span className="table-subtext">{job.searchSpec.keyword || job.searchSpec.name || "高级筛选"}{job.searchSpec.schemaVersion !== 2 ? " · 旧版待校验" : ""}{job.searchSpec.approximateLocationKeyword ? ` · 近似匹配：${job.searchSpec.approximateLocationKeyword}` : ""}</span></td><td>{job.source === "manual" ? "立即发布" : job.source === "schedule" ? "定时计划" : "历史迁移"}</td><td><QueueStatus status={job.status} /></td><td>{job.completedPages} / {job.limits.durationHours ? `${job.limits.durationHours}小时` : job.limits.maxPages || "自动"}<span className="table-subtext">{job.exportedCount}人{job.limits.durationHours ? "（不限人数）" : ""}</span></td><td>{job.xlsCount} / {job.pdfCount}</td><td>{job.uploadedCount}页</td><td>{job.searchId ? <><span className="mono">{job.searchId.slice(0, 12)}</span><span className="table-subtext">匹配{job.matchedCount ?? "未知"}</span></> : "待执行"}</td><td><div className="table-actions">{job.status === "queued" && <><Button size="small" icon={<ArrowUp24Regular />} aria-label="上移" disabled={busy} onClick={() => action(job, "move-up")} /><Button size="small" icon={<ArrowDown24Regular />} aria-label="下移" disabled={busy} onClick={() => action(job, "move-down")} /><Button size="small" icon={<Delete24Regular />} disabled={busy} onClick={() => action(job, "cancel")}>取消</Button></>}{job.status === "running" && <Button size="small" icon={<Pause24Regular />} disabled={busy} onClick={() => action(job, "pause")}>暂停</Button>}{["paused", "safety_stopped", "failed"].includes(job.status) && <Button size="small" icon={<Play24Regular />} disabled={busy} onClick={() => action(job, "resume")}>恢复</Button>}</div></td></tr>)}</tbody></table></div>;
+  return <div className="data-table-wrap"><table className="data-table collector-queue-table">
+    <thead><tr><th>排位</th><th>任务与条件</th><th>状态</th><th>本机完整页</th><th>上传／展示</th><th>搜索证据</th><th>操作</th></tr></thead>
+    <tbody>{jobs.map(job => {
+      const resumable = !job.searchId || job.resumeMode === "checkpoint";
+      const stopped = ["paused", "safety_stopped", "failed"].includes(job.status);
+      const count = job.collectedCount ?? job.exportedCount;
+      return <tr key={job.id}>
+        <td>{job.queuePosition ? `#${job.queuePosition}` : activeStatuses.has(job.status) ? "执行中" : "—"}</td>
+        <td><Link className="collector-job-link" to={`/collector/jobs/${encodeURIComponent(job.id)}`}>{job.name}</Link><span className="table-subtext">{job.searchSpec.keyword || job.searchSpec.name || "高级筛选"}{job.searchSpec.approximateLocationKeyword ? ` · 近似匹配：${job.searchSpec.approximateLocationKeyword}` : ""}</span></td>
+        <td><QueueStatus status={job.status} />{job.status === "completed" && <span className="table-subtext">采集已结束，不等待上传入库</span>}
+          {job.errorMessage && <span className="table-subtext">{job.errorCode}：{job.errorMessage}</span>}
+          {job.nextActionAt && <span className="table-subtext">下次动作：{new Date(job.nextActionAt).toLocaleString("zh-CN")}</span>}</td>
+        <td>{job.collectedPages ?? job.completedPages} 页<span className="table-subtext">已校验 {count} 人</span></td>
+        <td>已上传 {job.uploadedCount} 页<span className="table-subtext">已展示 {job.displayedCount ?? 0} 人 · 待上传 {Math.max(0, (job.collectedPages ?? job.completedPages) - job.uploadedCount)} 页</span>
+          <span className="table-subtext">待入库 {Math.max(0, job.exportedCount - (job.displayedCount ?? 0))} 人</span>{job.deliveryError && <span role="alert">{job.deliveryError}</span>}</td>
+        <td>{job.searchId || "待执行"}<span className="table-subtext">匹配 {job.matchedCount ?? "未知"}</span></td>
+        <td><div className="table-actions">
+          {job.status === "queued" && <><Button size="small" aria-label="上移" icon={<ArrowUp24Regular />} disabled={busy} onClick={() => action(job, "move-up")} /><Button size="small" aria-label="下移" icon={<ArrowDown24Regular />} disabled={busy} onClick={() => action(job, "move-down")} /><Button size="small" disabled={busy} onClick={() => action(job, "cancel")}>取消</Button></>}
+          {job.status === "running" && <Button size="small" icon={<Pause24Regular />} disabled={busy} onClick={() => action(job, "pause")}>暂停</Button>}
+          {stopped && resumable && <Button size="small" icon={<Play24Regular />} disabled={busy} onClick={() => action(job, "resume")}>{job.searchId ? "核验续跑" : "恢复排队"}</Button>}
+          {stopped && !resumable && <span className="table-subtext">需人工核对检查点</span>}
+        </div></td>
+      </tr>;
+    })}</tbody></table></div>;
+}
+
+export function queueWaitLabel(reason: string): string {
+  const labels: Record<string, string> = { browser_cooldown: "上一任务采集已结束，等待原定采集间隔", verification_required: "等待官网验证确认",
+    verification_failed: "官网页面核验未通过，已交还 Ego；处理后可再次确认",
+    another_job_running: "等待当前任务释放采集租约", global_safety_pause: "全局安全暂停，任务仅排队", daily_limit: "今日额度已用完",
+    catalog_unavailable: "筛选目录过期或不可用，请同步目录", search_requires_revalidation: "排队任务条件需重新校验",
+    checkpoint_resume_required: "检查点需要核验", queue_empty: "暂无待执行任务" };
+  return labels[reason] || `等待：${reason}`;
 }
 
 function AgentStrip({ agents }: { agents: Array<{ id: string; name: string; status: string; chromeReady: boolean; loginState: string; lastHeartbeatAt: string }> }) {
-  const agent = agents[0]; return <div className="collector-agent-strip"><div><span className={`collector-agent-dot ${agent?.status === "online" ? "is-online" : ""}`} /><strong>{agent?.name || "本机 Ego Agent 未连接"}</strong></div><span>Agent：{agent?.status === "online" ? "在线" : "离线"}</span><span>Ego：{agent?.chromeReady ? "已连接" : "未就绪"}</span><span>Bayt：{agent?.loginState === "logged_in" ? "已登录" : agent?.loginState === "login_required" ? "需要登录" : "未知"}</span><span>心跳：{agent ? new Date(agent.lastHeartbeatAt).toLocaleString("zh-CN") : "无"}</span></div>;
+  const agent = agents[0]; return <div className="collector-agent-strip"><div><span className={`collector-agent-dot ${agent?.status === "online" ? "is-online" : ""}`} /><strong>{agent?.name || "本机 Ego Agent 未连接"}</strong></div><span>Agent：{agent?.status === "online" ? "在线" : "离线"}</span><span>Ego：{agent?.chromeReady ? "已连接" : "未就绪"}</span><span>Bayt：{agent?.loginState === "logged_in" ? "已登录" : agent?.loginState === "login_required" ? "需要登录" : agent?.loginState === "verification_required" ? "等待人工验证" : "未知"}</span><span>心跳：{agent ? new Date(agent.lastHeartbeatAt).toLocaleString("zh-CN") : "无"}</span></div>;
 }
 
 function SchedulesTable({ schedules, templates, mutate }: { schedules: CollectorSchedule[]; templates: CollectorSearchTemplate[]; mutate: (action: () => Promise<unknown>) => void }) {

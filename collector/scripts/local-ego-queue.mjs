@@ -2,16 +2,16 @@
 // Activation requires the user to have completed the official-site challenge.
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
-import os from 'node:os';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { agentId, localPageInput, verificationId, controlRequest as request } from './local-queue-control.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const base = path.resolve(here, '../../data/local-runs');
 const queueDir = path.resolve(here, '../../data/local-queue');
 const activePath = path.join(queueDir, 'active.json');
-const agentId = `local-ego-${os.hostname().replace(/[^a-z0-9-]/gi, '-').toLowerCase()}`;
 const controlUrl = (process.env.BAYT_CONTROL_URL || '').replace(/\/$/, '');
 const token = process.env.BAYT_CONTROL_AGENT_TOKEN || '';
 const spaceId = Number(process.env.BAYT_EGO_SPACE_ID || 0);
@@ -33,19 +33,9 @@ export function checkpointInput(page, receipt) {
     pdfEntries: manifest.verification.pdfEntries, zipCrcOk: true, remoteBatch: receipt.remoteBatch };
 }
 
-async function request(route, body, leaseToken) {
-  const response = await fetch(`${controlUrl}/api/v1/collector/agent${route}`, {
-    method: 'POST', signal: AbortSignal.timeout(20_000),
-    headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json',
-      ...(leaseToken ? { 'x-collector-lease': leaseToken } : {}) }, body: JSON.stringify(body),
-  });
-  if (!response.ok) throw Error(`CONTROL_HTTP_${response.status}_${(await response.text()).slice(0, 100)}`);
-  return response.status === 204 ? null : await response.json();
-}
-
 async function atomicJson(file, value) {
   await fsp.mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
-  const temp = `${file}.${process.pid}.tmp`;
+  const temp = `${file}.${process.pid}.${crypto.randomUUID()}.tmp`;
   await fsp.writeFile(temp, JSON.stringify(value, null, 2), { mode: 0o600 });
   await fsp.rename(temp, file);
 }
@@ -53,7 +43,8 @@ async function atomicJson(file, value) {
 export function startSearchFailure(error) {
   const detail = String(error?.message || error);
   const rayId = detail.match(/rayId=([a-f0-9]{8,64})/i)?.[1] || null;
-  if (/BAYT_VERIFICATION_REQUIRED/.test(detail)) return {
+  if (/BAYT_RATE_LIMIT|BAYT_429|HTTP_429/.test(detail)) return { code: 'BAYT_429', message: '官网限流，停止领取新任务并保留原检查点', rayId: null };
+  if (/BAYT_VERIFICATION_REQUIRED|EGO_USER_CONTROL_REQUIRED|USER_VERIFICATION_REQUIRED|BAYT_LOGIN_REQUIRED/.test(detail)) return {
     code: 'BAYT_VERIFICATION_REQUIRED',
     message: `官网验证需要人工接手${rayId ? `；Ray ID ${rayId}` : ''}`,
     rayId,
@@ -121,7 +112,7 @@ export async function blockedByExistingRun(runBase = base) {
         // The checkpoint is authoritative: init-job writes it before status.json.
         // A crash in that window must not allow another search to be claimed.
         const state = await readJson(path.join(runBase, entry.name, 'checkpoint.json'));
-        if (!['completed', 'operator_stopped', 'safety_stopped'].includes(state.status)) return true;
+        if (!['completed', 'operator_stopped', 'safety_stopped', 'awaiting_verification'].includes(state.status)) return true;
       } catch {
         // An incomplete or corrupt local-ego run needs operator review too.
         return true;
@@ -135,6 +126,46 @@ export function assertNewSearchAllowed(job) {
   // A registered searchId may already have a verified page. A fresh search
   // would generate a different ID and could repeat that page's downloads.
   if (job.searchId) throw Error('EXISTING_SEARCH_ID_REQUIRES_CHECKPOINT_RESUME');
+}
+
+export function assertResumeClaim(job, runId, state, receipts) {
+  if (!job?.searchId || !/^local-ego-[A-Za-z0-9_-]{1,70}$/.test(runId || '') ||
+    state?.schemaVersion !== 2 || state.runId !== runId || state.queueJobId !== job.id ||
+    state.searchId !== job.searchId || !['safety_stopped', 'operator_stopped', 'awaiting_verification'].includes(state.status) ||
+    /UNCERTAIN|RETIRED|MISMATCH|CRC|MAPPING|INVALID/.test(state.stopReason || '') ||
+    state.intent || !Number.isFinite(Date.parse(state.deadlineAt)) ||
+    JSON.stringify(state.searchSpec) !== JSON.stringify(job.searchSpec) ||
+    JSON.stringify(state.limits) !== JSON.stringify(job.limits)) throw Error('CHECKPOINT_RESUME_IDENTITY_INVALID');
+  const pages = state.pages || [];
+  if (pages.length < (job.pages || []).length ||
+    ![pages.length, pages.length + 1].includes(state.current?.page) ||
+    state.seenIds?.length !== pages.reduce((sum, item) => sum + item.count, 0) ||
+    new Set(state.seenIds).size !== state.seenIds.length ||
+    receipts.length !== pages.length) throw Error('CHECKPOINT_RESUME_PAGES_INVALID');
+  for (let index = 0; index < pages.length; index++) {
+    const local = pages[index], remote = (job.pages || []).find(item => item.page === local.page), receipt = receipts[index];
+    const uploaded = localPageInput(local);
+    if (local.page !== index + 1) throw Error('CHECKPOINT_RESUME_PAGES_INVALID');
+    if (!remote) continue; // A verified local page may still be waiting for its independent uploader.
+    if (!receipt) throw Error('CHECKPOINT_RESUME_RECEIPT_MISSING');
+    checkpointInput(local, receipt);
+    if (remote.selectedCount !== uploaded.selectedCount ||
+      remote.cvIdSetSha256 !== uploaded.cvIdSetSha256 || remote.excelSha256 !== uploaded.excelSha256 ||
+      remote.pdfSha256 !== uploaded.pdfSha256 || remote.remoteBatch !== receipt.remoteBatch)
+      throw Error('CHECKPOINT_RESUME_REMOTE_MISMATCH');
+  }
+}
+
+export function terminalAcknowledged(active, local, remote) {
+  if (remote?.id !== active.jobId || remote.searchId !== active.searchId) return false;
+  if (remote.status === 'completed')
+    return local.status === 'completed' && local.pages?.length > 0 &&
+      ((remote.collectionFinishedAt && remote.collectedPages === local.pages.length) ||
+        (remote.completedPages === local.pages.length && active.checkpointedPages.length === local.pages.length));
+  if (remote.status === 'paused') return local.status === 'operator_stopped';
+  if (remote.status === 'safety_stopped')
+    return ['safety_stopped', 'awaiting_verification'].includes(local.status);
+  return false;
 }
 
 export async function completeRunRegistration(active, state, send, persist) {
@@ -174,10 +205,36 @@ export async function bootstrapRun(active, state, { register, activate, rebind }
 }
 
 async function ensureRunRegistered(active, state) {
+  const access = await uploadAccess(active);
   await completeRunRegistration(active, state,
     item => request(`/jobs/${encodeURIComponent(item.jobId)}/runs`,
-      { agentId, runId: path.basename(item.root), searchId: item.searchId }, item.leaseToken),
+      { agentId, runId: path.basename(item.root), searchId: item.searchId, uploadToken: access.uploadToken }, item.leaseToken),
     item => atomicJson(activePath, item));
+  await atomicJson(path.join(active.root, 'control-lease.json'), { confirmedAt: new Date().toISOString() });
+}
+
+async function uploadAccess(active) {
+  const file = path.join(active.root, 'control-upload.json');
+  let access;
+  try { access = await readJson(file); }
+  catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+    access = { jobId: active.jobId, runId: path.basename(active.root), agentId, uploadToken: crypto.randomBytes(32).toString('base64url') };
+    await atomicJson(file, access);
+  }
+  if (access.jobId !== active.jobId || access.runId !== path.basename(active.root) || access.agentId !== agentId)
+    throw Error('UPLOAD_RUN_IDENTITY_INVALID');
+  return access;
+}
+
+async function ensureUploadRegistered(active) {
+  const access = await uploadAccess(active);
+  if (!active.uploadRegistered) {
+    await request(`/jobs/${encodeURIComponent(active.jobId)}/runs`, { ...access, searchId: active.searchId }, active.leaseToken);
+    active.uploadRegistered = true;
+    await atomicJson(activePath, active);
+  }
+  return access;
 }
 
 async function syncCatalog() {
@@ -223,6 +280,37 @@ async function startRun(job, leaseToken) {
   return active;
 }
 
+async function startResume(job, leaseToken, runId) {
+  const root = path.join(base, runId || '');
+  if (!runId || path.basename(root) !== runId || await blockedByExistingRun())
+    throw Error('CHECKPOINT_RESUME_RUN_UNAVAILABLE');
+  const state = await readJson(path.join(root, 'checkpoint.json'));
+  const receipts = [];
+  for (const page of state.pages || []) {
+    const name = `${String(page.page).padStart(4, '0')}.json`;
+    let receipt = null;
+    try { receipt = await readJson(path.join(root, 'upload-receipts', name)); }
+    catch (error) { if (error.code !== 'ENOENT') throw error; }
+    const manifestFile = await fsp.readFile(path.join(root, 'batches', String(page.page).padStart(4, '0'), 'manifest.json'));
+    if (receipt && (receipt.status !== 'uploaded' || receipt.manifestSha256 !== crypto.createHash('sha256').update(manifestFile).digest('hex')))
+      throw Error('CHECKPOINT_RESUME_MANIFEST_MISMATCH');
+    receipts.push(receipt);
+  }
+  assertResumeClaim(job, runId, state, receipts);
+  await runProcess(process.execPath, ['--experimental-strip-types', path.join(here, 'local-ego-soak.mjs'), 'verify-resume', root, job.id]);
+  let userVerified = false;
+  try {
+    const marker = await readJson(path.join(queueDir, 'awaiting-verification.json'));
+    userVerified = marker.status === 'verified' && Date.parse(marker.verifiedAt) >= Date.parse(state.challenge?.notifiedAt || state.updatedAt);
+  } catch (error) { if (error.code !== 'ENOENT') throw error; }
+  if (state.status === 'awaiting_verification' && !userVerified) throw Error('USER_VERIFICATION_REQUIRED');
+  const active = { jobId: job.id, leaseToken, root, checkpointedPages: job.pages.map(page => page.page), userVerified,
+    searchId: job.searchId, matchedCount: job.matchedCount, actualFilterLabels: job.actualFilterLabels,
+    recoveryPending: true, needsRebind: true };
+  await atomicJson(activePath, active);
+  return active;
+}
+
 function launchWorkers(root) {
   const lockAlive = lock => {
     try { const pid = JSON.parse(fs.readFileSync(lock, 'utf8')).pid; process.kill(pid, 0); return true; }
@@ -233,11 +321,39 @@ function launchWorkers(root) {
       { cwd: here, env: process.env, stdio: 'ignore' });
     soak.on('error', () => {});
   }
-  if (!lockAlive(path.join(root, 'uploader.lock'))) {
+  launchUploader(root);
+}
+
+function launchUploader(root) {
+  let alive = false;
+  try { process.kill(JSON.parse(fs.readFileSync(path.join(root, 'uploader.lock'), 'utf8')).pid, 0); alive = true; }
+  catch { /* Only launch if the previous uploader is not alive. */ }
+  if (!alive) {
     const upload = spawn(process.execPath, ['--experimental-strip-types', path.join(here, 'local-ego-upload.mjs'), root],
       { cwd: here, env: process.env, stdio: 'ignore', detached: true });
     upload.on('error', () => {});
     upload.unref();
+  }
+}
+
+async function restoreUploadBacklogs() {
+  const entries = await fsp.readdir(base, { withFileTypes: true }).catch(error => { if (error.code === 'ENOENT') return []; throw error; });
+  for (const entry of entries) {
+    if (!entry.isDirectory() || !entry.name.startsWith('local-ego-')) continue;
+    const root = path.join(base, entry.name);
+    try {
+      const access = await readJson(path.join(root, 'control-upload.json'));
+      const state = await readJson(path.join(root, 'checkpoint.json'));
+      if (access.runId !== state.runId || access.jobId !== state.queueJobId || access.agentId !== agentId) continue;
+      for (const page of state.pages) {
+        let receipt;
+        try { receipt = await readJson(path.join(root, 'upload-receipts', `${String(page.page).padStart(4, '0')}.json`)); }
+        catch (error) { if (error.code !== 'ENOENT') throw error; }
+        if (!receipt?.controlAcknowledged && receipt?.status !== 'blocked') { launchUploader(root); break; }
+      }
+    } catch (error) {
+      if (error.code !== 'ENOENT') console.error(JSON.stringify({ event: 'upload_backlog_review', runId: entry.name }));
+    }
   }
 }
 
@@ -264,8 +380,34 @@ async function activePulse(active) {
   let state = await readJson(path.join(active.root, 'checkpoint.json'));
   const job = await request(`/jobs/${encodeURIComponent(active.jobId)}/heartbeat`, {
     agentId, evidence: { searchId: active.searchId, matchedCount: active.matchedCount,
-      actualFilterLabels: active.actualFilterLabels } }, active.leaseToken);
+      actualFilterLabels: active.actualFilterLabels, phase: state.phase, nextActionAt: state.nextActionAt } }, active.leaseToken);
+  await atomicJson(path.join(active.root, 'control-lease.json'), { confirmedAt: new Date().toISOString() });
   if (job.pauseRequested) await atomicJson(path.join(active.root, 'stop-requested.json'), { at: new Date().toISOString(), reason: 'queue_pause' });
+  // Register an independent, run-bound uploader before releasing any collection lease.
+  if (state.status !== 'prepared') await ensureUploadRegistered(active);
+  if (active.recoveryPending) {
+    try {
+      if (['safety_stopped', 'operator_stopped', 'awaiting_verification'].includes(state.status)) {
+        await runProcess(process.execPath, ['--experimental-strip-types', path.join(here, 'local-ego-soak.mjs'), active.userVerified ? 'resume-verified' : 'recover', active.root]);
+        state = await readJson(path.join(active.root, 'checkpoint.json'));
+      }
+      if (state.status === 'awaiting_verification') {
+        await atomicJson(path.join(queueDir, 'awaiting-verification.json'), {
+          jobId: active.jobId, at: new Date().toISOString(), status: 'awaiting_verification',
+          code: 'BAYT_VERIFICATION_REQUIRED', rayId: state.challenge?.rayId || null });
+        await terminal(active, 'BAYT_VERIFICATION_REQUIRED', '官网验证需要人工接手；检查点保持不变');
+        return false;
+      }
+      if (!['running', 'completed'].includes(state.status)) throw Error('CHECKPOINT_RECOVERY_NOT_RUNNING');
+      active.recoveryPending = false;
+      await atomicJson(activePath, active);
+    } catch (error) {
+      const failure = startSearchFailure(error);
+      if (failure.code === 'BAYT_VERIFICATION_REQUIRED') await handOffStartChallenge(active.jobId, failure);
+      await terminal(active, ['BAYT_VERIFICATION_REQUIRED', 'BAYT_429'].includes(failure.code) ? failure.code : 'CHECKPOINT_RESUME_BLOCKED', String(error.message).slice(0, 180));
+      return false;
+    }
+  }
   const activated = await bootstrapRun(active, state, {
     register: ensureRunRegistered,
     activate: item => runProcess(process.execPath,
@@ -274,36 +416,80 @@ async function activePulse(active) {
       ['--experimental-strip-types', path.join(here, 'local-ego-soak.mjs'), 'rebind-supervisor', item.root, String(process.pid)]),
   });
   if (activated) state = await readJson(path.join(active.root, 'checkpoint.json'));
-  try { await checkpointUploaded(active, state); }
-  catch (error) {
-    if (/UPLOAD_BLOCKED|RECEIPT_INVALID|PAGE_CHECKPOINT_CONFLICT/.test(String(error.message))) {
-      await terminal(active, 'UPLOAD_EVIDENCE_BLOCKED', '上传回执、文件或页级检查点冲突，已停止自动执行');
-      return false;
-    }
-    throw error;
-  }
+  await ensureUploadRegistered(active);
+  const pages = (state.pages || []).map(localPageInput);
+  await request(`/jobs/${encodeURIComponent(active.jobId)}/local-pages`,
+    { agentId, runId: path.basename(active.root), pages }, active.leaseToken);
+  launchUploader(active.root);
   if (state.status === 'running') { launchWorkers(active.root); return true; }
-  if ((state.pages || []).length > active.checkpointedPages.length) {
-    if (!active.uploadBacklogSince) { active.uploadBacklogSince = new Date().toISOString(); await atomicJson(activePath, active); }
-    if (Date.now() - Date.parse(active.uploadBacklogSince) < 60 * 60_000) return true;
-    await terminal(active, 'UPLOAD_BACKLOG_TIMEOUT', '已完成页面上传超过一小时未能确认，请核对独立上传进程');
-    return false;
-  }
   if (state.status === 'operator_stopped' && job.pauseRequested) {
     await request(`/jobs/${encodeURIComponent(active.jobId)}/pause-ack`, { agentId }, active.leaseToken);
     await fsp.unlink(activePath); return false;
   }
   if (state.status === 'completed') {
-    if ((state.pages || []).length !== active.checkpointedPages.length) return true;
     if (!state.pages?.length) { await terminal(active, 'JOB_HAS_NO_COMPLETE_PAGE', '任务没有经校验的完整页面'); return false; }
-    await request(`/jobs/${encodeURIComponent(active.jobId)}/complete`, { agentId }, active.leaseToken);
+    const access = await uploadAccess(active);
+    await request(`/jobs/${encodeURIComponent(active.jobId)}/collection-complete`,
+      { ...access, pages, cooldownUntil: state.browserCooldownUntil || null }, active.leaseToken);
     await fsp.unlink(activePath); return false;
   }
   if (state.status === 'awaiting_verification') {
+    await atomicJson(path.join(queueDir, 'awaiting-verification.json'), {
+      jobId: active.jobId, at: new Date().toISOString(), status: 'awaiting_verification',
+      code: 'BAYT_VERIFICATION_REQUIRED', rayId: state.challenge?.rayId || null });
     await terminal(active, 'BAYT_VERIFICATION_REQUIRED', '官网验证需要人工接手；本机任务已停在检查点'); return false;
   }
   await terminal(active, state.stopReason || 'LOCAL_RUN_STOPPED', '本机采集已安全停止，请核对检查点和未确定下载');
   return false;
+}
+
+export async function withLeaseHeartbeat(owner, operation, send = request, intervalMs = 30_000) {
+  let busy = false;
+  const timer = setInterval(async () => {
+    if (busy) return;
+    busy = true;
+    try {
+      await send(`/jobs/${encodeURIComponent(owner.jobId)}/heartbeat`, { agentId }, owner.leaseToken);
+      if (owner.root && send === request) await atomicJson(path.join(owner.root, 'control-lease.json'), { confirmedAt: new Date().toISOString() });
+    }
+    catch (error) { console.error(JSON.stringify({ event: 'lease_heartbeat_error', code: String(error.message).slice(0, 100) })); }
+    finally { busy = false; }
+  }, intervalMs);
+  try { return await operation(); }
+  finally { clearInterval(timer); }
+}
+
+async function handleVerificationRequest() {
+  const markerPath = path.join(queueDir, 'awaiting-verification.json');
+  const marker = await readJson(markerPath);
+  const id = verificationId(marker);
+  const item = marker.requestId ? { id: marker.requestId, interrupted: true } :
+    (await request('/verification/claim', { agentId, verificationId: id })).request;
+  if (!item) return false;
+  if (!marker.requestId) await atomicJson(markerPath, { ...marker, requestId: item.id });
+  const resultPath = path.join(queueDir, `verification-${item.id}.json`);
+  let result;
+  try { result = await readJson(resultPath); }
+  catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+    // A crash after dispatch is uncertain: never repeat a takeover without another user confirmation.
+    let verified = false;
+    if (!item.interrupted) {
+      try { verified = (await ego({ action: 'verifySession' })).verified === true; }
+      catch { /* Remain handed off. */ }
+    }
+    result = { requestId: item.id, verificationId: id, verified, at: new Date().toISOString() };
+    await atomicJson(resultPath, result);
+  }
+  await request('/verification/complete', { agentId, ...result });
+  if (!result.verified) {
+    await atomicJson(markerPath, { ...marker, requestId: null, lastVerificationFailedAt: result.at });
+    return false;
+  }
+  // Never erase a newer challenge marker that appeared while checking this one.
+  if (verificationId(await readJson(markerPath)) !== id) return false;
+  await atomicJson(markerPath, { ...marker, status: 'verified', verifiedAt: result.at, requestId: item.id });
+  return true;
 }
 
 async function main() {
@@ -315,19 +501,31 @@ async function main() {
   // Rebinding and pending registration happen inside the ordinary retry loop.
   // A temporary 108 outage during startup must not discard this active run.
   if (active) active.needsRebind = true;
+  let waitReason = null, waitUntil = null;
   while (true) {
     try {
+      await restoreUploadBacklogs();
       const needsVerification = await verificationPending();
-      await request('/heartbeat', { agentId, name: '本机 Ego Agent', version: '2', currentJobId: active?.jobId || null,
+      const marker = needsVerification ? await readJson(path.join(queueDir, 'awaiting-verification.json')) : null;
+      await request('/heartbeat', { agentId, name: '本机 Ego Agent', version: '3', currentJobId: active?.jobId || null,
         chromeReady: enabled && !needsVerification,
-        loginState: !enabled ? 'login_required' : needsVerification ? 'unknown' : 'logged_in' });
+        loginState: !enabled ? 'login_required' : needsVerification ? 'verification_required' : 'logged_in',
+        verificationId: marker ? verificationId(marker) : null, waitReason: needsVerification ? marker.lastVerificationFailedAt ? 'verification_failed' : 'verification_required' : waitReason,
+        nextActionAt: waitUntil });
       if (!enabled) { await delay(30_000); continue; }
-      if (needsVerification) { await delay(30_000); continue; }
+      if (needsVerification) {
+        if (active) {
+          await terminal(active, 'BAYT_VERIFICATION_REQUIRED', '官网验证等待用户确认；保留检查点');
+          active = null;
+        }
+        await handleVerificationRequest(); await delay(30_000); continue;
+      }
       if (active) {
-        if (!(await activePulse(active))) active = null;
+        if (!(await withLeaseHeartbeat(active, () => activePulse(active)))) active = null;
       } else if (!(await blockedByExistingRun())) {
         await syncCatalog();
         const claim = await request('/jobs/claim', { agentId });
+        waitReason = claim.waitReason || null; waitUntil = claim.waitUntil || null;
         if (claim.job && claim.leaseToken) {
           let heartbeatBusy = false;
           const keepLease = setInterval(async () => {
@@ -337,7 +535,9 @@ async function main() {
             catch (error) { console.error(JSON.stringify({ event: 'lease_heartbeat_error', code: String(error.message).slice(0, 80) })); }
             finally { heartbeatBusy = false; }
           }, 30_000);
-          try { active = await startRun(claim.job, claim.leaseToken); }
+          try { active = claim.resumeRunId
+            ? await startResume(claim.job, claim.leaseToken, claim.resumeRunId)
+            : await startRun(claim.job, claim.leaseToken); }
           catch (error) {
             let persisted = null;
             try { persisted = await readJson(activePath); }
@@ -348,7 +548,10 @@ async function main() {
               console.error(JSON.stringify({ event: 'run_bootstrap_deferred',
                 code: String(error.message).slice(0, 120), jobId: active.jobId }));
             } else {
-              const failure = startSearchFailure(error);
+              const classified = startSearchFailure(error);
+              const failure = claim.resumeRunId && !['BAYT_VERIFICATION_REQUIRED', 'BAYT_429'].includes(classified.code)
+                ? { code: 'CHECKPOINT_RESUME_BLOCKED', message: String(error.message).slice(0, 180), rayId: null }
+                : classified;
               if (failure.code === 'BAYT_VERIFICATION_REQUIRED') {
                 await handOffStartChallenge(claim.job.id, failure);
               }
@@ -360,7 +563,22 @@ async function main() {
       }
     } catch (error) {
       console.error(JSON.stringify({ event: 'queue_agent_error', code: String(error.message).slice(0, 120) }));
-      if (active && /INVALID_JOB_LEASE|CONTROL_HTTP_409/.test(String(error.message))) throw error;
+      if (active && /INVALID_JOB_LEASE|CONTROL_HTTP_409/.test(String(error.message))) {
+        try {
+          const remote = await request(`/jobs/${encodeURIComponent(active.jobId)}/state`, { agentId });
+          const local = await readJson(path.join(active.root, 'checkpoint.json'));
+          if (terminalAcknowledged(active, local, remote)) {
+            if (local.status === 'awaiting_verification') await atomicJson(path.join(queueDir, 'awaiting-verification.json'), {
+              jobId: active.jobId, at: new Date().toISOString(), status: 'awaiting_verification',
+              code: 'BAYT_VERIFICATION_REQUIRED', rayId: local.challenge?.rayId || null });
+            await fsp.unlink(activePath);
+            active = null;
+            console.error(JSON.stringify({ event: 'terminal_ack_recovered', jobId: remote.id, status: remote.status }));
+          }
+        } catch (reconcileError) {
+          console.error(JSON.stringify({ event: 'terminal_reconcile_deferred', code: String(reconcileError.message).slice(0, 100) }));
+        }
+      }
     }
     await delay(30_000);
   }

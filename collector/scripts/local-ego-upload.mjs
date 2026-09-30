@@ -1,4 +1,4 @@
-// Independent full-page publisher. It never asks Bayt for data or waits for the import service.
+// Independent full-page publisher. It never asks Bayt for data and never waits for 108 import.
 import fsp from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { verifyBulkBatch } from '../src/bulk-batch.ts';
 import { sha256File } from '../src/files.ts';
 import { runSftp, uploadBatchAtomically } from '../src/sftp-upload.ts';
+import { controlRequest, localPageInput } from './local-queue-control.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const base = path.resolve(here, '../../data/local-runs');
@@ -82,7 +83,9 @@ async function publish(root, state, page) {
   let receipt = null;
   try { receipt = JSON.parse(await fsp.readFile(receiptFile, 'utf8')); }
   catch (error) { if (error?.code !== 'ENOENT') throw error; }
-  if (receipt?.status === 'uploaded' && receipt.manifestSha256 === manifestHash) return;
+  if (receipt?.status === 'uploaded' && receipt.manifestSha256 === manifestHash) {
+    await acknowledgeUpload(root, state, page, receipt); return;
+  }
   if (receipt?.status === 'blocked') return;
   const remote = remoteBatch(config, state.runId, page.page);
   const temp = await fsp.mkdtemp(path.join(os.tmpdir(), 'bayt-sftp-check-'));
@@ -106,11 +109,22 @@ async function publish(root, state, page) {
       remoteBatch: remote, manifestSha256: manifestHash, excelSha256: expected['source.xls'],
       pdfSha256: expected['bayt-cvs.zip'], at: new Date().toISOString() });
     console.log(JSON.stringify({ event: 'page_uploaded', page: page.page, count: checked.selectedCount }));
+    await acknowledgeUpload(root, state, page, JSON.parse(await fsp.readFile(receiptFile, 'utf8')));
   } finally { await fsp.rm(temp, { recursive: true, force: true }); }
 }
 
+async function acknowledgeUpload(root, state, page, receipt) {
+  if (receipt.controlAcknowledged || !state.queueJobId) return;
+  let access;
+  try { access = JSON.parse(await fsp.readFile(path.join(root, 'control-upload.json'), 'utf8')); }
+  catch (error) { if (error.code === 'ENOENT') return; throw error; }
+  if (access.jobId !== state.queueJobId || access.runId !== state.runId) throw Error('UPLOAD_RUN_IDENTITY_INVALID');
+  await controlRequest(`/jobs/${encodeURIComponent(access.jobId)}/uploads`,
+    { ...access, ...localPageInput(page), remoteBatch: receipt.remoteBatch });
+  await writeJson(receiptPath(root, page.page), { ...receipt, controlAcknowledged: new Date().toISOString() });
+}
+
 async function run(root) {
-  if (!config.host || !config.user || !config.identityFile) throw Error('BAYT_SFTP_HOST, BAYT_SFTP_USER and BAYT_SFTP_IDENTITY_FILE are required');
   root = path.resolve(root || '');
   if (!root.startsWith(base + path.sep)) throw Error('RUN_ROOT_OUTSIDE_LOCAL_RUNS');
   const lock = path.join(root, 'uploader.lock');
@@ -137,10 +151,20 @@ async function run(root) {
           const message = String(error?.message || error).slice(0, 150);
           console.error(JSON.stringify({ event: 'upload_error', page: page.page, code: message }));
           if (message === 'REMOTE_CONTENT_CONFLICT') notifyBlocked();
+          try {
+            const access = JSON.parse(await fsp.readFile(path.join(root, 'control-upload.json'), 'utf8'));
+            if (access.jobId === state.queueJobId && access.runId === state.runId)
+              await controlRequest(`/jobs/${encodeURIComponent(access.jobId)}/delivery-error`,
+                { ...access, code: /CONFLICT|MISMATCH|INVALID/.test(message) ? 'UPLOAD_EVIDENCE_BLOCKED' : 'UPLOAD_RETRY_PENDING' });
+          } catch { /* Keep the local receipt and retry independently of the collection lease. */ }
           retry.attempts += 1;
           retry.next = Date.now() + Math.min(30 * 60_000, 30_000 * 2 ** Math.min(retry.attempts, 6));
           retries.set(page.page, retry);
         }
+      }
+      if (['completed', 'safety_stopped', 'operator_stopped', 'awaiting_verification'].includes(state.status)) {
+        const receipts = await Promise.all(state.pages.map(page => fsp.readFile(receiptPath(root, page.page), 'utf8').then(JSON.parse).catch(() => null)));
+        if (receipts.every(item => item?.status === 'uploaded' && (!state.queueJobId || item.controlAcknowledged))) return;
       }
       await delay(30_000);
     }

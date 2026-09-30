@@ -154,6 +154,14 @@ export interface CollectionJob {
   startedAt: string | null;
   completedAt: string | null;
   pages: JobPageCheckpoint[];
+  collectedPages: number;
+  collectedCount: number;
+  displayedCount: number;
+  collectionFinishedAt: string | null;
+  phase: string | null;
+  nextActionAt: string | null;
+  deliveryError: string | null;
+  resumeMode: "new_search" | "checkpoint" | "review";
 }
 
 export interface AgentState {
@@ -164,7 +172,10 @@ export interface AgentState {
   lastHeartbeatAt: string;
   currentJobId: string | null;
   chromeReady: boolean;
-  loginState: "unknown" | "logged_in" | "login_required";
+  loginState: "unknown" | "logged_in" | "login_required" | "verification_required";
+  waitReason?: string | null;
+  nextActionAt?: string | null;
+  verificationId?: string | null;
 }
 
 export class CollectorControlError extends Error {
@@ -199,6 +210,23 @@ const cleanText = (value: unknown, maximum: number, label: string): string => {
 };
 const optionalText = (value: unknown, maximum: number): string =>
   String(value || "").replace(/[\u0000-\u001f]/g, " ").replace(/\s+/g, " ").trim().slice(0, maximum);
+
+function pageEvidence(input: Record<string, unknown>): Record<string, unknown> {
+  const page = Number(input.page), selectedCount = Number(input.selectedCount);
+  if (!Number.isInteger(page) || page < 1 || page > 10000 || !Number.isInteger(selectedCount) || selectedCount < 1 || selectedCount > 50 ||
+    !["cvIdSetSha256", "excelSha256", "pdfSha256"].every(key => /^[a-f0-9]{64}$/.test(String(input[key] || ""))))
+    throw new CollectorControlError("完整页证据无效", "INVALID_PAGE_CHECKPOINT", 409);
+  if (![input.excelSizeBytes, input.pdfSizeBytes].every(n => Number.isInteger(n) && Number(n) > 0) ||
+    input.pdfEntries !== selectedCount || input.zipCrcOk !== true)
+    throw new CollectorControlError("完整页文件验收未通过", "INVALID_PAGE_CHECKPOINT", 409);
+  return { page, selectedCount, cvIdSetSha256: input.cvIdSetSha256, excelSha256: input.excelSha256,
+    excelSizeBytes: input.excelSizeBytes, pdfSha256: input.pdfSha256, pdfSizeBytes: input.pdfSizeBytes,
+    pdfEntries: input.pdfEntries, zipCrcOk: true };
+}
+
+const checkpointResumeCodes = new Set(["NEXT_PAGE_OVERLAP", "CROSS_PAGE_CV_ID_OVERLAP", "SEARCH_FORM_UNVERIFIED",
+  "BAYT_VERIFICATION_REQUIRED", "TRANSIENT_RETRY_EXHAUSTED", "QUEUE_SUPERVISOR_LOST", "LEASE_EXPIRED_REVIEW",
+  "CHECKPOINT_RESUME_BLOCKED", "LOCAL_RUN_STOPPED", "LOCAL_STOP_REQUESTED", "LOCAL_LEASE_HEARTBEAT_LOST", "CHECKPOINT_RESUME_REQUESTED"]);
 
 function normalizeAdvanced(input: unknown): AdvancedFilterCatalog | null {
   if (!input || typeof input !== "object") return null;
@@ -514,6 +542,23 @@ export class CollectorControlStore {
     const jobColumns = this.db.prepare("PRAGMA table_info(collector_jobs)").all() as Array<{ name: string }>;
     if (!jobColumns.some((column) => column.name === "client_request_id")) this.db.exec("ALTER TABLE collector_jobs ADD COLUMN client_request_id TEXT");
     this.db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_collector_jobs_client_request ON collector_jobs(client_request_id) WHERE client_request_id IS NOT NULL");
+    for (const name of ["collection_finished_at", "collection_phase", "next_action_at", "delivery_error"])
+      if (!jobColumns.some(column => column.name === name)) this.db.exec(`ALTER TABLE collector_jobs ADD COLUMN ${name} TEXT`);
+    const runColumns = this.db.prepare("PRAGMA table_info(collector_job_runs)").all() as Array<{ name: string }>;
+    for (const name of ["agent_id", "upload_token_hash", "finished_json"])
+      if (!runColumns.some(column => column.name === name)) this.db.exec(`ALTER TABLE collector_job_runs ADD COLUMN ${name} TEXT`);
+    const agentColumns = this.db.prepare("PRAGMA table_info(collector_agents)").all() as Array<{ name: string }>;
+    for (const name of ["wait_reason", "next_action_at", "verification_id"])
+      if (!agentColumns.some(column => column.name === name)) this.db.exec(`ALTER TABLE collector_agents ADD COLUMN ${name} TEXT`);
+    this.db.exec(`CREATE TABLE IF NOT EXISTS collector_local_pages (
+      job_id TEXT NOT NULL, run_id TEXT NOT NULL, page_no INTEGER NOT NULL, selected_count INTEGER NOT NULL,
+      evidence_json TEXT NOT NULL, collected_at TEXT NOT NULL, PRIMARY KEY(job_id, page_no),
+      FOREIGN KEY(job_id) REFERENCES collector_jobs(id), FOREIGN KEY(run_id) REFERENCES collector_job_runs(run_id));
+      CREATE TABLE IF NOT EXISTS collector_verification_requests (
+      id TEXT PRIMARY KEY, agent_id TEXT NOT NULL, verification_id TEXT NOT NULL, status TEXT NOT NULL,
+      requested_at TEXT NOT NULL, completed_at TEXT, detail TEXT);
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_verification_active ON collector_verification_requests(agent_id, verification_id)
+        WHERE status IN ('pending','checking');`);
   }
 
   close(): void {
@@ -806,6 +851,9 @@ export class CollectorControlStore {
   private jobFromRow(row: Record<string, unknown>): CollectionJob {
     const id = String(row.id);
     const pages = (this.db.prepare("SELECT * FROM collector_job_pages WHERE job_id = ? ORDER BY page_no").all(id) as Record<string, unknown>[]).map(pageFromRow);
+    const local = this.db.prepare("SELECT COUNT(*) AS pages, COALESCE(SUM(selected_count),0) AS count FROM collector_local_pages WHERE job_id = ?").get(id) as { pages: number; count: number };
+    const displayed = this.db.prepare("SELECT COUNT(*) AS count FROM collector_job_people WHERE job_id = ?").get(id) as { count: number };
+    const runs = this.db.prepare("SELECT COUNT(*) AS count FROM collector_job_runs WHERE job_id = ? AND search_id = ?").get(id, String(row.search_id || "")) as { count: number };
     return {
       id,
       templateId: row.template_id ? String(row.template_id) : null,
@@ -835,6 +883,15 @@ export class CollectorControlStore {
       startedAt: row.started_at ? String(row.started_at) : null,
       completedAt: row.completed_at ? String(row.completed_at) : null,
       pages,
+      collectedPages: Math.max(Number(local.pages), Number(row.completed_pages)),
+      collectedCount: Math.max(Number(local.count), Number(row.exported_count)),
+      displayedCount: Number(displayed.count),
+      collectionFinishedAt: row.collection_finished_at ? String(row.collection_finished_at) : null,
+      phase: row.collection_phase ? String(row.collection_phase) : null,
+      nextActionAt: row.next_action_at ? String(row.next_action_at) : null,
+      deliveryError: row.delivery_error ? String(row.delivery_error) : null,
+      resumeMode: !row.search_id ? "new_search" : runs.count === 1 &&
+        (row.status === "paused" || checkpointResumeCodes.has(String(row.error_code || ""))) ? "checkpoint" : "review",
     };
   }
 
@@ -845,6 +902,15 @@ export class CollectorControlStore {
   getJob(id: string): CollectionJob | null {
     const row = this.db.prepare("SELECT * FROM collector_jobs WHERE id = ?").get(id) as Record<string, unknown> | undefined;
     return row ? this.jobFromRow(row) : null;
+  }
+
+  agentJobState(id: string, agentId: string): Pick<CollectionJob, "id" | "status" | "searchId" | "completedPages" | "collectedPages" | "collectionFinishedAt"> {
+    const job = this.getJob(id);
+    const ownedRun = this.db.prepare("SELECT run_id FROM collector_job_runs WHERE job_id = ? AND agent_id = ? LIMIT 1").get(id, agentId);
+    if (!job || !agentId.startsWith("local-ego-") || (job.agentId !== agentId && !ownedRun))
+      throw new CollectorControlError("Agent不可读取该任务", "AGENT_JOB_NOT_FOUND", 404);
+    return { id: job.id, status: job.status, searchId: job.searchId, completedPages: job.completedPages,
+      collectedPages: job.collectedPages, collectionFinishedAt: job.collectionFinishedAt };
   }
 
   private normalizeQueue(): void {
@@ -901,7 +967,8 @@ export class CollectorControlStore {
       throw new CollectorControlError("只有已暂停任务可以调整运行范围", "JOB_LIMITS_NOT_EDITABLE", 409);
     }
     const limits = normalizeLimits(input);
-    // 持续时长从恢复领取时重新计时，暂停和部署耗时不计入24小时样本。
+    if (job.searchId) throw new CollectorControlError("已有搜索检查点的任务必须保留原运行范围和截止时间", "CHECKPOINT_LIMITS_IMMUTABLE", 409);
+    // Only an unstarted search may change its limits.
     this.db.prepare("UPDATE collector_jobs SET limits_json = ?, started_at = NULL WHERE id = ?").run(JSON.stringify(limits), id);
     return this.getJob(id)!;
   }
@@ -911,17 +978,18 @@ export class CollectorControlStore {
     if (!job || !["paused", "safety_stopped", "failed"].includes(job.status)) {
       throw new CollectorControlError("任务当前不可恢复", "JOB_NOT_RESUMABLE", 409);
     }
-    // A registered Bayt search may already have uploaded pages. The current
-    // queue worker starts a fresh search, so requeuing this job would create a
-    // different searchId and risk repeating the first page.
     if (job.searchId) {
-      throw new CollectorControlError("已有搜索检查点的任务需要专门续跑核验，不能作为新搜索重新排队", "JOB_CHECKPOINT_RESUME_REQUIRED", 409);
+      if (job.resumeMode !== "checkpoint") {
+        throw new CollectorControlError("该检查点尚不支持自动续跑；需核对本机运行状态和下载意图", "JOB_CHECKPOINT_RESUME_REQUIRED", 409);
+      }
     }
     this.db.exec("BEGIN IMMEDIATE");
     try {
       this.db.prepare(`UPDATE collector_jobs SET status = 'queued', queue_position = ?, pause_requested = 0,
-        agent_id = NULL, lease_token_hash = NULL, lease_expires_at = NULL, error_code = NULL,
-        error_message = NULL, completed_at = NULL WHERE id = ?`).run(this.nextQueuePosition(), id);
+        agent_id = NULL, lease_token_hash = NULL, lease_expires_at = NULL,
+        error_code = CASE WHEN search_id IS NULL THEN NULL ELSE COALESCE(error_code, 'CHECKPOINT_RESUME_REQUESTED') END,
+        error_message = CASE WHEN search_id IS NULL THEN NULL ELSE error_message END,
+        completed_at = NULL WHERE id = ?`).run(this.nextQueuePosition(), id);
       this.db.exec("COMMIT");
     } catch (error) {
       this.db.exec("ROLLBACK");
@@ -960,7 +1028,46 @@ export class CollectorControlStore {
       queuedCount: Number(queued.count),
       dailyExportedCount: this.dailyExportedCount(),
       dailyLimit: activeJob?.limits.durationHours ? null : 500,
+      browserNextActionAt: this.browserNextActionAt(),
     };
+  }
+
+  private browserNextActionAt(): string | null {
+    const row = this.db.prepare("SELECT MAX(json_extract(finished_json, '$.cooldownUntil')) AS value FROM collector_job_runs WHERE finished_json IS NOT NULL").get() as { value: string | null };
+    return row.value && Date.parse(row.value) > Date.now() ? row.value : null;
+  }
+
+  requestVerification(agentId: string, verificationId: string): Record<string, unknown> {
+    const agent = this.listAgents().find(item => item.id === agentId);
+    if (!agent || agent.status !== "online" || agent.loginState !== "verification_required" ||
+      !verificationId || agent.verificationId !== verificationId)
+      throw new CollectorControlError("验证状态已变化，请刷新后重试", "VERIFICATION_STATE_CHANGED", 409);
+    const existing = this.db.prepare("SELECT * FROM collector_verification_requests WHERE agent_id = ? AND verification_id = ? AND status IN ('pending','checking')")
+      .get(agentId, verificationId) as Record<string, unknown> | undefined;
+    if (existing) return existing;
+    const id = randomId("verification");
+    this.db.prepare("INSERT INTO collector_verification_requests(id,agent_id,verification_id,status,requested_at) VALUES (?,?,?,'pending',?)")
+      .run(id, agentId, verificationId, nowIso());
+    return { id, status: "pending" };
+  }
+
+  claimVerification(agentId: string, verificationId: string): Record<string, unknown> | null {
+    const row = this.db.prepare("SELECT * FROM collector_verification_requests WHERE agent_id = ? AND verification_id = ? AND status IN ('pending','checking') ORDER BY requested_at LIMIT 1")
+      .get(agentId, verificationId) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    this.db.prepare("UPDATE collector_verification_requests SET status = 'checking' WHERE id = ?").run(String(row.id));
+    return { id: row.id, verificationId: row.verification_id, interrupted: row.status === "checking" };
+  }
+
+  completeVerification(agentId: string, id: string, verificationId: string, verified: boolean): void {
+    const row = this.db.prepare("SELECT * FROM collector_verification_requests WHERE id = ? AND agent_id = ? AND verification_id = ?")
+      .get(id, agentId, verificationId) as Record<string, unknown> | undefined;
+    const status = verified ? "verified" : "failed";
+    if (!row || !["checking", status].includes(String(row.status)))
+      throw new CollectorControlError("验证请求状态不匹配", "VERIFICATION_STATE_CHANGED", 409);
+    this.db.prepare("UPDATE collector_verification_requests SET status = ?, completed_at = COALESCE(completed_at, ?) WHERE id = ?")
+      .run(status, nowIso(), id);
+    // Global pause is deliberately untouched, even on successful verification.
   }
 
   heartbeatAgent(input: Record<string, unknown>): AgentState {
@@ -968,13 +1075,16 @@ export class CollectorControlStore {
     const timestamp = nowIso();
     const name = cleanText(input.name || id, 120, "Agent名称");
     const version = cleanText(input.version || "unknown", 80, "Agent版本");
-    const loginState = ["unknown", "logged_in", "login_required"].includes(String(input.loginState)) ? String(input.loginState) : "unknown";
+    const loginState = ["unknown", "logged_in", "login_required", "verification_required"].includes(String(input.loginState)) ? String(input.loginState) : "unknown";
     this.db.prepare(`INSERT INTO collector_agents(id, name, version, last_heartbeat_at, current_job_id, chrome_ready, login_state)
       VALUES (?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(id) DO UPDATE SET name=excluded.name, version=excluded.version,
       last_heartbeat_at=excluded.last_heartbeat_at, current_job_id=excluded.current_job_id,
       chrome_ready=excluded.chrome_ready, login_state=excluded.login_state`)
       .run(id, name, version, timestamp, input.currentJobId ? String(input.currentJobId) : null, input.chromeReady ? 1 : 0, loginState);
+    this.db.prepare("UPDATE collector_agents SET wait_reason = ?, next_action_at = ?, verification_id = ? WHERE id = ?")
+      .run(optionalText(input.waitReason, 100) || null, input.nextActionAt && Number.isFinite(Date.parse(String(input.nextActionAt))) ? String(input.nextActionAt) : null,
+        optionalText(input.verificationId, 128) || null, id);
     return { id, name, version, status: "online", lastHeartbeatAt: timestamp, currentJobId: input.currentJobId ? String(input.currentJobId) : null, chromeReady: Boolean(input.chromeReady), loginState: loginState as AgentState["loginState"] };
   }
 
@@ -989,6 +1099,9 @@ export class CollectorControlStore {
       currentJobId: row.current_job_id ? String(row.current_job_id) : null,
       chromeReady: Boolean(row.chrome_ready),
       loginState: String(row.login_state) as AgentState["loginState"],
+      waitReason: row.wait_reason ? String(row.wait_reason) : null,
+      nextActionAt: row.next_action_at ? String(row.next_action_at) : null,
+      verificationId: row.verification_id ? String(row.verification_id) : null,
     }));
   }
 
@@ -1007,19 +1120,26 @@ export class CollectorControlStore {
 
   dailyExportedCount(at = new Date()): number {
     const bounds = beijingDateBounds(at);
-    const row = this.db.prepare("SELECT COALESCE(SUM(selected_count), 0) AS total FROM collector_job_pages WHERE uploaded_at >= ? AND uploaded_at < ?").get(bounds.start, bounds.end) as { total: number };
+    const row = this.db.prepare(`SELECT COALESCE(SUM(selected_count), 0) AS total FROM (
+      SELECT selected_count FROM collector_local_pages WHERE collected_at >= ? AND collected_at < ?
+      UNION ALL SELECT p.selected_count FROM collector_job_pages p WHERE p.uploaded_at >= ? AND p.uploaded_at < ?
+        AND NOT EXISTS(SELECT 1 FROM collector_local_pages l WHERE l.job_id = p.job_id AND l.page_no = p.page_no))`)
+      .get(bounds.start, bounds.end, bounds.start, bounds.end) as { total: number };
     return Number(row.total);
   }
 
-  claimJob(agentId: string, leaseMs = 120_000): { job: CollectionJob | null; leaseToken?: string; waitReason?: string; waitUntil?: string } {
+  claimJob(agentId: string, leaseMs = 120_000): { job: CollectionJob | null; leaseToken?: string; resumeRunId?: string; waitReason?: string; waitUntil?: string } {
     this.recoverExpiredLeases();
     if (!agentId.startsWith("local-ego-")) return { job: null, waitReason: "local_ego_only" };
     const state = this.getControlState();
     if (state.globallyPaused) return { job: null, waitReason: "global_safety_pause" };
     if (state.runningJobId) return { job: null, waitReason: "another_job_running" };
+    if (state.browserNextActionAt) return { job: null, waitReason: "browser_cooldown", waitUntil: String(state.browserNextActionAt) };
+    const agent = this.listAgents().find(item => item.id === agentId);
+    if (agent?.loginState === "verification_required") return { job: null, waitReason: "verification_required" };
     const catalog = this.getCatalog().catalog;
-    if (!catalog?.advanced?.reliable || !catalog.agentId.startsWith("local-ego-") ||
-      Date.now() - Date.parse(catalog.synchronizedAt) > 24 * 60 * 60 * 1000) return { job: null, waitReason: "catalog_unavailable" };
+    const catalogReady = Boolean(catalog?.advanced?.reliable && catalog.agentId.startsWith("local-ego-") &&
+      Date.now() - Date.parse(catalog.synchronizedAt) <= 24 * 60 * 60 * 1000);
     this.db.exec("BEGIN IMMEDIATE");
     try {
       const running = this.db.prepare("SELECT id FROM collector_jobs WHERE status IN ('running','pause_requested') LIMIT 1").get();
@@ -1027,15 +1147,23 @@ export class CollectorControlStore {
         this.db.exec("COMMIT");
         return { job: null, waitReason: "another_job_running" };
       }
-      const row = this.db.prepare("SELECT id, search_id FROM collector_jobs WHERE status = 'queued' AND json_extract(search_spec_json, '$.schemaVersion') = 2 AND json_extract(search_spec_json, '$.filterSchemaVersion') = ? ORDER BY queue_position, created_at LIMIT 1").get(catalog.version) as { id?: string; search_id?: string | null } | undefined;
+      const rows = this.db.prepare("SELECT * FROM collector_jobs WHERE status = 'queued' ORDER BY queue_position, created_at").all() as Record<string, unknown>[];
+      const eligible = rows.map(row => this.jobFromRow(row)).find(job => job.searchSpec.schemaVersion === 2 &&
+        (job.searchId ? job.resumeMode === "checkpoint" : catalogReady && job.searchSpec.filterSchemaVersion === catalog?.version));
+      const row = eligible ? { id: eligible.id, search_id: eligible.searchId, error_code: eligible.errorCode } : undefined;
+      let resumeRunId: string | undefined;
       if (row?.search_id) {
-        this.db.exec("COMMIT");
-        return { job: null, waitReason: "checkpoint_resume_required" };
+        const runs = this.db.prepare("SELECT run_id, search_id FROM collector_job_runs WHERE job_id = ?").all(row.id) as Array<{ run_id: string; search_id: string }>;
+        if (runs.length !== 1 || runs[0].search_id !== row.search_id) {
+          this.db.exec("COMMIT");
+          return { job: null, waitReason: "checkpoint_resume_required" };
+        }
+        resumeRunId = runs[0].run_id;
       }
       if (!row?.id) {
         this.db.exec("COMMIT");
-        const legacy = this.db.prepare("SELECT id FROM collector_jobs WHERE status = 'queued' LIMIT 1").get();
-        return { job: null, waitReason: legacy ? "search_requires_revalidation" : "queue_empty" };
+        const blocked = this.db.prepare("SELECT search_id FROM collector_jobs WHERE status = 'queued' LIMIT 1").get() as { search_id?: string | null } | undefined;
+        return { job: null, waitReason: blocked?.search_id ? "checkpoint_resume_required" : blocked ? catalogReady ? "search_requires_revalidation" : "catalog_unavailable" : "queue_empty" };
       }
       const queuedJob = this.getJob(row.id);
       if (!queuedJob?.limits.durationHours && 500 - this.dailyExportedCount() < 50) {
@@ -1050,7 +1178,7 @@ export class CollectorControlStore {
         WHERE id = ?`).run(agentId, hashToken(leaseToken), expiresAt, nowIso(), row.id);
       this.normalizeQueue();
       this.db.exec("COMMIT");
-      return { job: this.getJob(row.id), leaseToken };
+      return { job: this.getJob(row.id), leaseToken, ...(resumeRunId ? { resumeRunId } : {}) };
     } catch (error) {
       this.db.exec("ROLLBACK");
       throw error;
@@ -1065,22 +1193,33 @@ export class CollectorControlStore {
     return this.jobFromRow(row);
   }
 
-  registerRun(jobId: string, agentId: string, leaseToken: string, runId: unknown, searchId: unknown): void {
+  registerRun(jobId: string, agentId: string, leaseToken: string, runId: unknown, searchId: unknown, uploadToken?: unknown): void {
     const job = this.verifyLease(jobId, agentId, leaseToken);
     const run = String(runId || "");
     const search = String(searchId || "");
-    if (job.status !== "running" || job.searchSpec.schemaVersion !== 2 ||
+    if (!["running", "pause_requested"].includes(job.status) || job.searchSpec.schemaVersion !== 2 ||
       !/^local-ego-[A-Za-z0-9_-]{1,70}$/.test(run) || !/^[A-Za-z0-9_-]{4,200}$/.test(search) ||
       (job.searchId && job.searchId !== search)) {
       throw new CollectorControlError("任务运行标识不匹配", "RUN_JOB_LINK_INVALID", 409);
     }
-    const existing = this.db.prepare("SELECT job_id, search_id FROM collector_job_runs WHERE run_id = ?").get(run) as
-      { job_id: string; search_id: string } | undefined;
+    const existing = this.db.prepare("SELECT job_id, search_id, upload_token_hash FROM collector_job_runs WHERE run_id = ?").get(run) as
+      { job_id: string; search_id: string; upload_token_hash: string | null } | undefined;
     if (existing && (existing.job_id !== jobId || existing.search_id !== search))
       throw new CollectorControlError("运行ID已绑定其他任务", "RUN_JOB_LINK_CONFLICT", 409);
+    if (!existing && this.db.prepare("SELECT run_id FROM collector_job_runs WHERE job_id = ? LIMIT 1").get(jobId))
+      throw new CollectorControlError("已有运行不能重新建搜索", "RUN_JOB_LINK_CONFLICT", 409);
+    const token = uploadToken === undefined ? null : String(uploadToken);
+    if (token !== null && !/^[A-Za-z0-9_-]{43,128}$/.test(token))
+      throw new CollectorControlError("上传令牌无效", "UPLOAD_TOKEN_INVALID", 409);
+    if (token && existing?.upload_token_hash && existing.upload_token_hash !== hashToken(token))
+      throw new CollectorControlError("原运行上传令牌不匹配", "UPLOAD_TOKEN_CONFLICT", 409);
     this.db.prepare("INSERT OR IGNORE INTO collector_job_runs(run_id, job_id, search_id, registered_at) VALUES (?, ?, ?, ?)")
       .run(run, jobId, search, nowIso());
     this.db.prepare("UPDATE collector_jobs SET search_id = COALESCE(search_id, ?) WHERE id = ?").run(search, jobId);
+    if (token) {
+      this.db.prepare("UPDATE collector_job_runs SET agent_id = ?, upload_token_hash = ? WHERE run_id = ?")
+        .run(agentId, hashToken(token), run);
+    }
   }
 
   jobForRun(runId: string): string | null {
@@ -1139,6 +1278,8 @@ export class CollectorControlStore {
 
   heartbeatJob(jobId: string, agentId: string, leaseToken: string, evidence: Record<string, unknown> = {}, leaseMs = 120_000): CollectionJob {
     const job = this.verifyLease(jobId, agentId, leaseToken);
+    if (job.searchId && evidence.searchId && evidence.searchId !== job.searchId)
+      throw new CollectorControlError("搜索标识变化", "RUN_JOB_LINK_INVALID", 409);
     this.db.prepare(`UPDATE collector_jobs SET lease_expires_at = ?, search_id = COALESCE(?, search_id),
       matched_count = COALESCE(?, matched_count), actual_filter_labels_json = CASE WHEN ? IS NULL THEN actual_filter_labels_json ELSE ? END
       WHERE id = ?`).run(
@@ -1150,11 +1291,98 @@ export class CollectorControlStore {
         Array.isArray(evidence.actualFilterLabels) ? JSON.stringify(evidence.actualFilterLabels.map(String).slice(0, 100)) : null,
         jobId,
       );
+    if (evidence.phase !== undefined) this.db.prepare("UPDATE collector_jobs SET collection_phase = ?, next_action_at = ? WHERE id = ?")
+      .run(optionalText(evidence.phase, 80) || null,
+        evidence.nextActionAt && Number.isFinite(Date.parse(String(evidence.nextActionAt))) ? String(evidence.nextActionAt) : null, jobId);
     return this.getJob(job.id)!;
   }
 
   checkpointPage(jobId: string, agentId: string, leaseToken: string, input: Record<string, unknown>): CollectionJob {
     const job = this.verifyLease(jobId, agentId, leaseToken);
+    return this.storeUploadedPage(job, input);
+  }
+
+  authorizeUpload(jobId: string, agentId: string, runId: string, token: string): void {
+    const row = this.db.prepare("SELECT job_id,agent_id,upload_token_hash FROM collector_job_runs WHERE run_id = ?").get(runId) as Record<string, unknown> | undefined;
+    if (!row || row.job_id !== jobId || row.agent_id !== agentId || !token || row.upload_token_hash !== hashToken(token))
+      throw new CollectorControlError("上传运行认证失败", "UPLOAD_RUN_UNAUTHORIZED", 403);
+  }
+
+  checkpointUpload(jobId: string, agentId: string, input: Record<string, unknown>): CollectionJob {
+    this.authorizeUpload(jobId, agentId, String(input.runId || ""), String(input.uploadToken || ""));
+    const match = String(input.remoteBatch || "").match(/\/(local-ego-[A-Za-z0-9_-]{1,70})\/batch-(\d{4})$/);
+    if (!match || match[1] !== input.runId) throw new CollectorControlError("上传运行不匹配", "RUN_JOB_LINK_INVALID", 409);
+    return this.storeUploadedPage(this.getJob(jobId)!, input);
+  }
+
+  private saveLocalPages(jobId: string, runId: string, input: unknown): void {
+    if (this.jobForRun(runId) !== jobId || !Array.isArray(input) || input.length > 10000)
+      throw new CollectorControlError("本机页检查点不匹配", "LOCAL_CHECKPOINT_INVALID", 409);
+    const evidence = input.map(item => pageEvidence(item));
+    const previous = this.db.prepare("SELECT page_no,run_id,evidence_json FROM collector_local_pages WHERE job_id = ? ORDER BY page_no").all(jobId) as Array<{ page_no: number; run_id: string; evidence_json: string }>;
+    if (previous.length > evidence.length) throw new CollectorControlError("检查点不能倒退", "LOCAL_CHECKPOINT_REGRESSION", 409);
+    for (let index = 0; index < evidence.length; index++) {
+      const item = evidence[index];
+      if (item.page !== index + 1 || (previous[index] && (previous[index].run_id !== runId || previous[index].evidence_json !== JSON.stringify(item))))
+        throw new CollectorControlError("本机页证据发生变化", "PAGE_CHECKPOINT_CONFLICT", 409);
+    }
+    const job = this.getJob(jobId)!;
+    for (const page of job.pages) {
+      if (JSON.stringify(evidence[page.page - 1]) !== JSON.stringify(pageEvidence(page as unknown as Record<string, unknown>)))
+        throw new CollectorControlError("本机页与已上传页不匹配", "PAGE_CHECKPOINT_CONFLICT", 409);
+    }
+    const freshCount = evidence.filter(item => !previous.some(p => p.page_no === item.page) && !job.pages.some(p => p.page === item.page))
+      .reduce((sum, item) => sum + Number(item.selectedCount), 0);
+    if (!job.limits.durationHours && this.dailyExportedCount() + freshCount > 500)
+      throw new CollectorControlError("完整页超过每日上限", "DAILY_EXPORT_LIMIT", 409);
+    for (const item of evidence) this.db.prepare("INSERT OR IGNORE INTO collector_local_pages(job_id,run_id,page_no,selected_count,evidence_json,collected_at) VALUES (?,?,?,?,?,?)")
+      .run(jobId, runId, Number(item.page), Number(item.selectedCount), JSON.stringify(item), nowIso());
+  }
+
+  reportLocalPages(jobId: string, agentId: string, leaseToken: string, input: Record<string, unknown>): CollectionJob {
+    this.verifyLease(jobId, agentId, leaseToken);
+    this.db.exec("BEGIN IMMEDIATE");
+    try { this.saveLocalPages(jobId, String(input.runId || ""), input.pages); this.db.exec("COMMIT"); }
+    catch (error) { this.db.exec("ROLLBACK"); throw error; }
+    return this.getJob(jobId)!;
+  }
+
+  finishCollection(jobId: string, agentId: string, leaseToken: string, input: Record<string, unknown>): CollectionJob {
+    const runId = String(input.runId || "");
+    this.authorizeUpload(jobId, agentId, runId, String(input.uploadToken || ""));
+    if (!Array.isArray(input.pages) || !input.pages.length)
+      throw new CollectorControlError("任务没有完整页检查点", "JOB_HAS_NO_COMPLETE_PAGE", 409);
+    const cooldownUntil = input.cooldownUntil ? String(input.cooldownUntil) : null;
+    if (cooldownUntil && !Number.isFinite(Date.parse(cooldownUntil)))
+      throw new CollectorControlError("下次采集时间无效", "INVALID_COOLDOWN", 409);
+    const receipt = JSON.stringify({ pages: input.pages.map(item => pageEvidence(item)), cooldownUntil });
+    const prior = this.db.prepare("SELECT finished_json FROM collector_job_runs WHERE run_id = ?").get(runId) as { finished_json: string | null };
+    if (prior.finished_json) {
+      if (prior.finished_json !== receipt) throw new CollectorControlError("完成回执内容不一致", "FINISH_RECEIPT_CONFLICT", 409);
+      return this.getJob(jobId)!;
+    }
+    this.verifyLease(jobId, agentId, leaseToken);
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.saveLocalPages(jobId, runId, input.pages);
+      this.db.prepare("UPDATE collector_job_runs SET finished_json = ? WHERE run_id = ?").run(receipt, runId);
+      this.db.prepare(`UPDATE collector_jobs SET status = 'completed', pause_requested = 0,
+        lease_token_hash = NULL, lease_expires_at = NULL, completed_at = ?, collection_finished_at = ?,
+        collection_phase = 'finished', next_action_at = NULL, error_code = NULL, error_message = NULL WHERE id = ?`)
+        .run(nowIso(), nowIso(), jobId);
+      this.db.exec("COMMIT");
+    } catch (error) { this.db.exec("ROLLBACK"); throw error; }
+    return this.getJob(jobId)!;
+  }
+
+  reportDeliveryError(jobId: string, agentId: string, input: Record<string, unknown>): void {
+    this.authorizeUpload(jobId, agentId, String(input.runId || ""), String(input.uploadToken || ""));
+    this.db.prepare("UPDATE collector_jobs SET delivery_error = ? WHERE id = ?")
+      .run(optionalText(input.code, 100) || "UPLOAD_RETRY_PENDING", jobId);
+  }
+
+  private storeUploadedPage(job: CollectionJob, input: Record<string, unknown>): CollectionJob {
+    const jobId = job.id;
     const page = Number(input.page);
     const selectedCount = Number(input.selectedCount);
     if (!Number.isInteger(page) || page < 1 || page > 10_000 || !Number.isInteger(selectedCount) || selectedCount < 1 || selectedCount > 50) {
@@ -1179,14 +1407,19 @@ export class CollectorControlStore {
         throw new CollectorControlError("页级批次不属于该任务", "RUN_JOB_LINK_INVALID", 409);
     }
     const existing = this.db.prepare("SELECT * FROM collector_job_pages WHERE job_id = ? AND page_no = ?").get(jobId, page) as Record<string, unknown> | undefined;
+    const local = this.db.prepare("SELECT evidence_json FROM collector_local_pages WHERE job_id = ? AND page_no = ?").get(jobId, page) as { evidence_json: string } | undefined;
+    if (job.collectionFinishedAt && !local)
+      throw new CollectorControlError("完成的任务不能增加新页", "FINISHED_RUN_PAGE_INVALID", 409);
+    if (local && local.evidence_json !== JSON.stringify(pageEvidence(input)))
+      throw new CollectorControlError("上传文件与本机完整页检查点冲突", "PAGE_CHECKPOINT_CONFLICT", 409);
     if (existing) {
       const previous = pageFromRow(existing);
-      if (previous.cvIdSetSha256 !== input.cvIdSetSha256 || previous.excelSha256 !== input.excelSha256 || previous.pdfSha256 !== input.pdfSha256) {
+      if (JSON.stringify(pageEvidence(previous as unknown as Record<string, unknown>)) !== JSON.stringify(pageEvidence(input)) || previous.remoteBatch !== remoteBatch) {
         throw new CollectorControlError("同一页的文件或CV_ID集合发生变化", "PAGE_CHECKPOINT_CONFLICT", 409);
       }
       return job;
     }
-    if (!job.limits.durationHours && this.dailyExportedCount() + selectedCount > 500) {
+    if (!local && !job.limits.durationHours && this.dailyExportedCount() + selectedCount > 500) {
       throw new CollectorControlError("写入该完整页将超过北京时间当日500条上限", "DAILY_EXPORT_LIMIT", 409);
     }
     const uploadedAt = nowIso();
@@ -1199,8 +1432,8 @@ export class CollectorControlStore {
         .run(jobId, page, selectedCount, String(input.cvIdSetSha256), String(input.excelSha256), excelSize, String(input.pdfSha256), pdfSize, pdfEntries, remoteBatch, uploadedAt);
       const totals = this.db.prepare("SELECT COUNT(*) AS pages, COALESCE(SUM(selected_count),0) AS exported FROM collector_job_pages WHERE job_id = ?").get(jobId) as { pages: number; exported: number };
       this.db.prepare(`UPDATE collector_jobs SET current_page = ?, completed_pages = ?, exported_count = ?,
-        xls_count = ?, pdf_count = ?, uploaded_count = ?, lease_expires_at = ? WHERE id = ?`)
-        .run(page, totals.pages, totals.exported, totals.pages, totals.pages, totals.pages, new Date(Date.now() + 120_000).toISOString(), jobId);
+        xls_count = ?, pdf_count = ?, uploaded_count = ?, delivery_error = NULL WHERE id = ?`)
+        .run(page, totals.pages, totals.exported, totals.pages, totals.pages, totals.pages, jobId);
       this.db.exec("COMMIT");
     } catch (error) {
       this.db.exec("ROLLBACK");
@@ -1232,8 +1465,12 @@ export class CollectorControlStore {
     const timestamp = nowIso();
     this.db.exec("BEGIN IMMEDIATE");
     try {
-      this.db.prepare("UPDATE collector_control_state SET globally_paused = 1, pause_code = ?, pause_message = ?, paused_at = ?, updated_at = ? WHERE singleton = 1")
+      // Only proven task-local failures can release the queue without a shared pause.
+      // Verification has its own durable agent gate and does not erase an existing global pause.
+      const taskLocal = ["SEARCH_FORM_UNVERIFIED", "CHECKPOINT_RESUME_BLOCKED", "TRANSIENT_RETRY_EXHAUSTED", "LOCAL_STOP_REQUESTED", "JOB_HAS_NO_COMPLETE_PAGE"].includes(code);
+      if (!taskLocal && code !== "BAYT_VERIFICATION_REQUIRED") this.db.prepare("UPDATE collector_control_state SET globally_paused = 1, pause_code = ?, pause_message = ?, paused_at = ?, updated_at = ? WHERE singleton = 1")
         .run(code, message, timestamp, timestamp);
+      if (code === "BAYT_VERIFICATION_REQUIRED") this.db.prepare("UPDATE collector_agents SET login_state = 'verification_required' WHERE id = ?").run(agentId);
       this.db.prepare(`UPDATE collector_jobs SET status = 'safety_stopped', pause_requested = 0,
         lease_token_hash = NULL, lease_expires_at = NULL, error_code = ?, error_message = ?, completed_at = ? WHERE id = ?`)
         .run(code, message, timestamp, jobId);

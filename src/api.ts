@@ -110,6 +110,7 @@ export const apiClient = {
   deleteCollectorSearchTemplate: (id: string) => api<void>(`/api/v1/collector/search-templates/${encodeURIComponent(id)}`, collectorMutationInit({ method: "DELETE" })),
   collectorQueue: () => api<{ items: CollectionQueueJob[]; control: CollectorControlState; agents: CollectorAgentState[] }>("/api/v1/collector/jobs"),
   collectorJob: (id: string) => api<CollectionQueueJob>(`/api/v1/collector/jobs/${encodeURIComponent(id)}`),
+  confirmCollectorVerification: (agentId: string, verificationId: string) => api<{ id: string; status: string }>("/api/v1/collector/verification", collectorMutationInit({ method: "POST", body: JSON.stringify({ agentId, verificationId }) })),
   collectorJobPeople: (id: string, page: number) => api<CollectorJobPeopleResponse>(`/api/v1/collector/jobs/${encodeURIComponent(id)}/people?page=${page}&pageSize=12`),
   createCollectionJob: (input: { templateId?: string; name?: string; searchSpec?: CollectorSearchSpec; limits: CollectorLimits; clientRequestId?: string }) => api<CollectionQueueJob>("/api/v1/collector/jobs", collectorMutationInit({ method: "POST", body: JSON.stringify(input) })),
   acknowledgeCollectorSafety: (reason: string) => api<CollectorControlState>("/api/v1/collector/control/acknowledge-safety", collectorMutationInit({ method: "POST", body: JSON.stringify({ reason }) })),

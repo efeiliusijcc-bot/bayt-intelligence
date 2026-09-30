@@ -4,6 +4,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import express from "express";
+import { createCollectorAgentRouter, collectorRouteError } from "./collector-routes.ts";
 import { CollectorControlError, CollectorControlStore, type SearchSpec } from "./collector-control.ts";
 import { config } from "./config.ts";
 import { parseExcelCandidates } from "./import-service.ts";
@@ -47,10 +49,10 @@ function fixtureStore(): { store: CollectorControlStore; directory: string; vers
     advanced: {
       keywordModes: [{ key: "any", label: "Any words" }, { key: "exact", label: "Exact order" }],
       nameSupported: true,
-      locations: [{ key: "jordan", label: "Jordan", cities: [{ key: "jo,1,0", label: "Amman" }] },
-        { key: "oman", label: "Oman", cities: [] }],
-      jobRoles: [{ key: "engineering", label: "Engineering" }, { key: "teaching", label: "Teaching and Academics" }],
-      industries: [{ key: "software", label: "Software Services" }, { key: "education", label: "Education" }],
+      locations: [{ key: "syria", label: "Syria", cities: [{ key: "sy,12,0", label: "Jisr ash Shughur" }] },
+        { key: "afghanistan", label: "Afghanistan", cities: [] }],
+      jobRoles: [{ key: "logistics", label: "Logistics and Transportation" }, { key: "teaching", label: "Teaching and Academics" }],
+      industries: [{ key: "nonprofit", label: "Non-profit Organization" }, { key: "religion", label: "Religious Institution & Place of Worship" }],
       exclusionSupported: true, reliable: true,
     },
   });
@@ -70,6 +72,138 @@ function cleanup(store: CollectorControlStore, directory: string): void {
   store.close();
   fs.rmSync(directory, { recursive: true, force: true });
 }
+
+const localEvidence = (page = 1) => ({ page, selectedCount: 2, cvIdSetSha256: "c".repeat(64),
+  excelSha256: "a".repeat(64), excelSizeBytes: 100, pdfSha256: "b".repeat(64), pdfSizeBytes: 200,
+  pdfEntries: 2, zipCrcOk: true });
+
+test("HTTP上传在采集租约释放后继续，108实际复核文件且重复回执幂等", { skip: !fs.existsSync(config.sampleExcelPath) || !fs.existsSync(config.sampleZipPath) }, async () => {
+  const { store, directory, version } = fixtureStore();
+  const token = crypto.randomBytes(32).toString("hex"), uploadToken = crypto.randomBytes(32).toString("base64url");
+  const incoming = path.join(directory, "incoming"), runId = "local-ego-http-test";
+  const app = express(); app.use(express.json());
+  app.use(createCollectorAgentRouter(store, token, { localRoot: incoming, remoteRoot: "/incoming" }));
+  app.use(collectorRouteError);
+  const server = app.listen(0, "127.0.0.1");
+  try {
+    await new Promise<void>(resolve => server.once("listening", resolve));
+    const address = server.address() as { port: number };
+    const call = (route: string, body: unknown, auth = token, lease?: string) => fetch(`http://127.0.0.1:${address.port}${route}`, {
+      method: "POST", headers: { Authorization: `Bearer ${auth}`, "Content-Type": "application/json", ...(lease ? { "X-Collector-Lease": lease } : {}) }, body: JSON.stringify(body) });
+    const job = store.createJob({ searchSpec: spec(version), limits: { maxPages: 1 } });
+    const claim = store.claimJob("local-ego-http");
+    store.registerRun(job.id, "local-ego-http", claim.leaseToken!, runId, "search-http", uploadToken);
+    const dir = path.join(incoming, runId, "batch-0001"); fs.mkdirSync(dir, { recursive: true });
+    const excel = path.join(dir, "source.xls"), zip = path.join(dir, "bayt-cvs.zip");
+    fs.copyFileSync(config.sampleExcelPath, excel); fs.copyFileSync(config.sampleZipPath, zip);
+    const ids = parseExcelCandidates(excel).map(item => item.cvId);
+    const sha = (file: string) => crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex");
+    const evidence = { ...localEvidence(), selectedCount: ids.length, pdfEntries: ids.length,
+      cvIdSetSha256: crypto.createHash("sha256").update(ids.sort().join("\n")).digest("hex"),
+      excelSha256: sha(excel), excelSizeBytes: fs.statSync(excel).size, pdfSha256: sha(zip), pdfSizeBytes: fs.statSync(zip).size };
+    fs.writeFileSync(path.join(dir, "manifest.json"), JSON.stringify({ schemaVersion: 2, queueJobId: job.id, runId,
+      page: 1, selectedCount: ids.length, cvIdSetSha256: evidence.cvIdSetSha256,
+      files: { excel: { sha256: evidence.excelSha256 }, pdfArchive: { sha256: evidence.pdfSha256 } }, verification: { exactMatch: true, zipCrcFailures: 0 } }));
+    const body = { agentId: "local-ego-http", runId, uploadToken, pages: [evidence], cooldownUntil: null };
+    assert.equal((await call(`/jobs/${job.id}/collection-complete`, body, "wrong", claim.leaseToken)).status, 401);
+    assert.equal((await call(`/jobs/${job.id}/collection-complete`, body, token, claim.leaseToken)).status, 200);
+    assert.equal((await call(`/jobs/${job.id}/collection-complete`, body, token, claim.leaseToken)).status, 200);
+    const upload = { ...body, ...evidence, remoteBatch: `/incoming/${runId}/batch-0001` };
+    assert.equal((await call(`/jobs/${job.id}/uploads`, { ...upload, uploadToken: "wrong" })).status, 403);
+    assert.equal((await call(`/jobs/${job.id}/uploads`, upload)).status, 200);
+    assert.equal((await call(`/jobs/${job.id}/uploads`, upload)).status, 200);
+    assert.equal(store.getJob(job.id)?.uploadedCount, 1);
+  } finally { server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve())); cleanup(store, directory); }
+});
+
+test("三个任务串行接力，完成回执丢失和重启不重复采集，上传不占采集租约", () => {
+  const fixture = fixtureStore();
+  let store = fixture.store;
+  try {
+    const jobs = [1,2,3].map(n => store.createJob({ name: `接力${n}`, searchSpec: spec(fixture.version, `query${n}`), limits: { maxPages: 1 } }));
+    for (const [index, job] of jobs.entries()) {
+      const claim = store.claimJob("local-ego-test");
+      assert.equal(claim.job?.id, job.id);
+      assert.equal(store.claimJob("local-ego-other").waitReason, "another_job_running");
+      const runId = `local-ego-serial-${index}`, uploadToken = crypto.randomBytes(32).toString("base64url");
+      store.registerRun(job.id, "local-ego-test", claim.leaseToken!, runId, `search-${index}`, uploadToken);
+      const input = { runId, uploadToken, pages: [localEvidence()], cooldownUntil: null };
+      store.reportLocalPages(job.id, "local-ego-test", claim.leaseToken!, input);
+      const finished = store.finishCollection(job.id, "local-ego-test", claim.leaseToken!, input);
+      assert.equal(finished.status, "completed");
+      assert.equal(finished.uploadedCount, 0);
+      assert.equal(finished.collectedCount, 2);
+      store.close(); store = new CollectorControlStore(path.join(fixture.directory, "control.db"));
+      // Simulate commit success followed by a lost HTTP response and process restart.
+      assert.equal(store.finishCollection(job.id, "local-ego-test", claim.leaseToken!, input).status, "completed");
+      assert.throws(() => store.finishCollection(job.id, "local-ego-test", claim.leaseToken!, { ...input, pages: [localEvidence(), localEvidence(2)] }), /回执内容不一致/);
+      const upload = { runId, uploadToken, ...localEvidence(), remoteBatch: `/incoming/${runId}/batch-0001` };
+      assert.throws(() => store.checkpointUpload(job.id, "local-ego-test", { ...upload, uploadToken: "bad" }), /认证失败/);
+      assert.throws(() => store.checkpointUpload(job.id, "local-ego-test", { ...upload, excelSha256: "d".repeat(64) }), /冲突/);
+      store.checkpointUpload(job.id, "local-ego-test", upload);
+      store.checkpointUpload(job.id, "local-ego-test", upload);
+      assert.equal(store.getJob(job.id)?.uploadedCount, 1);
+      assert.equal(store.dailyExportedCount(), (index + 1) * 2);
+      const row = store.db.prepare("SELECT upload_token_hash FROM collector_job_runs WHERE run_id = ?").get(runId);
+      assert.notEqual(row?.upload_token_hash, uploadToken);
+    }
+    assert.equal(store.claimJob("local-ego-test").waitReason, "queue_empty");
+  } finally { cleanup(store, fixture.directory); }
+});
+
+test("完成后仍保留浏览器冷却间隔；暂停续跑不重置范围和截止起点", () => {
+  const { store, directory, version } = fixtureStore();
+  try {
+    const job = store.createJob({ searchSpec: spec(version), limits: { maxPages: 1 } });
+    const claim = store.claimJob("local-ego-test");
+    const uploadToken = "u".repeat(43), runId = "local-ego-cooldown";
+    store.registerRun(job.id, "local-ego-test", claim.leaseToken!, runId, "search-cooldown", uploadToken);
+    store.pauseJob(job.id); store.acknowledgePause(job.id, "local-ego-test", claim.leaseToken!);
+    assert.throws(() => store.updatePausedJobLimits(job.id, { durationHours: 24 }), /原运行范围/);
+    const resumed = store.resumeJob(job.id);
+    assert.equal(resumed.resumeMode, "checkpoint");
+    assert.equal(resumed.startedAt, claim.job?.startedAt);
+    const lease = store.claimJob("local-ego-test");
+    assert.equal(lease.resumeRunId, runId);
+    const cooldownUntil = new Date(Date.now() + 60 * 60_000).toISOString();
+    store.finishCollection(job.id, "local-ego-test", lease.leaseToken!, { runId, uploadToken, pages: [localEvidence()], cooldownUntil });
+    store.createJob({ searchSpec: spec(version, "next"), limits: { maxPages: 1 } });
+    assert.equal(store.claimJob("local-ego-test").waitReason, "browser_cooldown");
+    assert.equal(store.getControlState().browserNextActionAt, cooldownUntil);
+  } finally { cleanup(store, directory); }
+});
+
+test("官网验证必须显式请求，确认幂等且不解除已有全局暂停", () => {
+  const { store, directory } = fixtureStore();
+  try {
+    store.heartbeatAgent({ agentId: "local-ego-test", loginState: "verification_required", verificationId: "marker-one" });
+    store.db.prepare("UPDATE collector_control_state SET globally_paused = 1 WHERE singleton = 1").run();
+    assert.equal(store.claimVerification("local-ego-test", "marker-one"), null);
+    assert.throws(() => store.requestVerification("local-ego-test", "different-marker"), /状态已变化/);
+    const req = store.requestVerification("local-ego-test", "marker-one");
+    assert.equal(store.requestVerification("local-ego-test", "marker-one").id, req.id);
+    assert.equal(store.claimVerification("local-ego-test", "marker-one")?.interrupted, false);
+    assert.equal(store.claimVerification("local-ego-test", "marker-one")?.interrupted, true);
+    store.completeVerification("local-ego-test", String(req.id), "marker-one", true);
+    store.completeVerification("local-ego-test", String(req.id), "marker-one", true);
+    assert.equal(store.getControlState().globallyPaused, true);
+  } finally { cleanup(store, directory); }
+});
+
+test("任务局部表单错误释放队列，下载不确定仍停止全局", () => {
+  const { store, directory, version } = fixtureStore();
+  try {
+    const first = store.createJob({ searchSpec: spec(version), limits: { maxPages: 1 } });
+    const second = store.createJob({ searchSpec: spec(version, "next"), limits: { maxPages: 1 } });
+    const a = store.claimJob("local-ego-test");
+    store.safetyStop(first.id, "local-ego-test", a.leaseToken!, { code: "SEARCH_FORM_UNVERIFIED", message: "本任务控件不可用" });
+    assert.equal(store.getControlState().globallyPaused, false);
+    const b = store.claimJob("local-ego-test");
+    assert.equal(b.job?.id, second.id);
+    store.safetyStop(second.id, "local-ego-test", b.leaseToken!, { code: "UNCERTAIN_DOWNLOAD_RESULT", message: "下载结果不明" });
+    assert.equal(store.getControlState().globallyPaused, true);
+  } finally { cleanup(store, directory); }
+});
 
 test("Filter目录严格校验键、选项、版本和暂不支持项", () => {
   const { store, directory, version } = fixtureStore();
@@ -111,18 +245,18 @@ test("Filter目录领取响应丢失后同一Agent可以幂等恢复", () => {
 test("多地点、职能行业与排除条件以新版快照保存，近似地点必须分开入队", () => {
   const { store, directory, version } = fixtureStore();
   try {
-    assert.throws(() => store.validateSearchSpec({ ...spec(version, ""), name: "Example-Surname" }),
+    assert.throws(() => store.validateSearchSpec({ ...spec(version, ""), name: "al-Turkistani" }),
       (error: unknown) => error instanceof CollectorControlError && error.code === "INVALID_NAME_FILTER");
     const exact = store.validateSearchSpec({ ...spec(version), pastJobLocations: [
-      { countryKey: "jordan", cityKey: "jo,1,0" }, { countryKey: "oman", cityKey: null }],
-      includeJobRoles: ["engineering", "teaching"], excludeIndustries: ["education"] });
+      { countryKey: "syria", cityKey: "sy,12,0" }, { countryKey: "afghanistan", cityKey: null }],
+      includeJobRoles: ["logistics", "teaching"], excludeIndustries: ["religion"] });
     assert.equal(exact.pastJobLocations?.length, 2);
-    assert.deepEqual(exact.includeJobRoles, ["engineering", "teaching"]);
-    assert.throws(() => store.validateSearchSpec({ ...exact, approximateLocationKeyword: "Example Region" }),
+    assert.deepEqual(exact.includeJobRoles, ["logistics", "teaching"]);
+    assert.throws(() => store.validateSearchSpec({ ...exact, approximateLocationKeyword: "Badakhshan" }),
       (error: unknown) => error instanceof CollectorControlError && error.code === "APPROXIMATE_LOCATION_CONFLICT");
-    const approximate = store.validateSearchSpec({ ...spec(version, "Example Region"), approximateLocationKeyword: "Example Region" });
-    assert.equal(approximate.approximateLocationKeyword, "Example Region");
-    assert.throws(() => store.validateSearchSpec({ ...spec(version), pastJobLocations: [{ countryKey: "oman", cityKey: "unknown-city" }] }),
+    const approximate = store.validateSearchSpec({ ...spec(version, "Badakhshan"), approximateLocationKeyword: "Badakhshan" });
+    assert.equal(approximate.approximateLocationKeyword, "Badakhshan");
+    assert.throws(() => store.validateSearchSpec({ ...spec(version), pastJobLocations: [{ countryKey: "afghanistan", cityKey: "badakhshan" }] }),
       (error: unknown) => error instanceof CollectorControlError && error.code === "INVALID_LOCATION_SELECTION");
   } finally { cleanup(store, directory); }
 });
@@ -136,7 +270,7 @@ test("重复发布按请求键去重且旧模板不交给本机Ego领取", () =>
     assert.throws(() => store.createJob({ ...input, name: "其他任务" }),
       (error: unknown) => error instanceof CollectorControlError && error.code === "CLIENT_REQUEST_CONFLICT");
     const legacy = store.createJob({ name: "旧版", searchSpec: { keyword: "old", filterSchemaVersion: version, filters: [], sortKey: null }, limits: { maxPages: 1 } });
-    assert.equal(store.claimJob("windows-agent").waitReason, "local_ego_only");
+    assert.equal(store.claimJob("windows-154").waitReason, "local_ego_only");
     assert.equal(store.claimJob("local-ego-one").job?.id, first.id);
     assert.equal(store.getJob(legacy.id)?.status, "queued");
   } finally { cleanup(store, directory); }
@@ -172,22 +306,59 @@ test("恢复单个任务不解除全局安全暂停；必须管理员单独确�
   } finally { cleanup(store, directory); }
 });
 
-test("已有搜索检查点的旧任务不能重新排队或被当成新搜索领取", () => {
+test("检查点任务只允许原运行ID续跑，不能被当成新搜索领取", () => {
   const { store, directory, version } = fixtureStore();
   try {
     const job = store.createJob({ searchSpec: spec(version), limits: { maxPages: 2 } });
     const claim = store.claimJob("local-ego-one");
     store.registerRun(job.id, "local-ego-one", claim.leaseToken!, "local-ego-existing-run", "search-existing");
     store.safetyStop(job.id, "local-ego-one", claim.leaseToken!, { code: "NEXT_PAGE_OVERLAP", message: "overlap" });
-    assert.throws(() => store.resumeJob(job.id),
-      (error: unknown) => error instanceof CollectorControlError && error.code === "JOB_CHECKPOINT_RESUME_REQUIRED");
-    assert.equal(store.getJob(job.id)?.status, "safety_stopped");
-
-    // Also defend a legacy queued row created before this guard was deployed.
-    store.db.prepare("UPDATE collector_jobs SET status = 'queued', queue_position = 1 WHERE id = ?").run(job.id);
+    assert.equal(store.resumeJob(job.id).status, "queued");
+    assert.equal(store.getControlState().globallyPaused, true);
     store.acknowledgeGlobalPause("检查旧运行归属后继续其他任务");
-    assert.equal(store.claimJob("local-ego-two").waitReason, "checkpoint_resume_required");
-    assert.equal(store.getJob(job.id)?.status, "queued");
+    const resumed = store.claimJob("local-ego-two");
+    assert.equal(resumed.job?.id, job.id);
+    assert.equal(resumed.resumeRunId, "local-ego-existing-run");
+    assert.equal(resumed.job?.searchId, "search-existing");
+    assert.deepEqual(store.agentJobState(job.id, "local-ego-two"), {
+      id: job.id, status: "running", searchId: "search-existing", completedPages: 0,
+      collectedPages: 0, collectionFinishedAt: null,
+    });
+    assert.throws(() => store.agentJobState(job.id, "local-ego-other"),
+      (error: unknown) => error instanceof CollectorControlError && error.code === "AGENT_JOB_NOT_FOUND");
+  } finally { cleanup(store, directory); }
+});
+
+test("不支持的旧检查点不能阻塞后续正常任务", () => {
+  const { store, directory, version } = fixtureStore();
+  try {
+    const old = store.createJob({ searchSpec: spec(version), limits: { maxPages: 2 } });
+    const claim = store.claimJob("local-ego-one");
+    store.registerRun(old.id, "local-ego-one", claim.leaseToken!, "local-ego-old-run", "search-old");
+    store.safetyStop(old.id, "local-ego-one", claim.leaseToken!, { code: "UNCERTAIN_DOWNLOAD_RESULT", message: "uncertain" });
+    assert.throws(() => store.resumeJob(old.id),
+      (error: unknown) => error instanceof CollectorControlError && error.code === "JOB_CHECKPOINT_RESUME_REQUIRED");
+    // Simulate a queued row written by an older release: it must be skipped,
+    // not become a new search or hold the entire FIFO queue hostage.
+    store.db.prepare("UPDATE collector_jobs SET status = 'queued', queue_position = 1 WHERE id = ?").run(old.id);
+    const next = store.createJob({ searchSpec: spec(version, "Next"), limits: { maxPages: 1 } });
+    store.acknowledgeGlobalPause("只允许后续安全任务执行");
+    assert.equal(store.claimJob("local-ego-two").job?.id, next.id);
+  } finally { cleanup(store, directory); }
+});
+
+test("搜索表单错误只能作为原检查点的核验续跑请求", () => {
+  const { store, directory, version } = fixtureStore();
+  try {
+    const job = store.createJob({ searchSpec: spec(version), limits: { maxPages: 2 } });
+    const claim = store.claimJob("local-ego-one");
+    store.registerRun(job.id, "local-ego-one", claim.leaseToken!, "local-ego-form-run", "search-form");
+    store.safetyStop(job.id, "local-ego-one", claim.leaseToken!, { code: "SEARCH_FORM_UNVERIFIED", message: "原页需核验" });
+    store.resumeJob(job.id);
+    assert.equal(store.getControlState().globallyPaused, false);
+    const resumed = store.claimJob("local-ego-one");
+    assert.equal(resumed.resumeRunId, "local-ego-form-run");
+    assert.equal(resumed.job?.searchId, "search-form");
   } finally { cleanup(store, directory); }
 });
 
@@ -358,7 +529,7 @@ test("计划触发跳过同模板重复任务并保留事件", () => {
   }
 });
 
-test("服务端独立核验SFTP落盘哈希、CV_ID映射、ZIP CRC且拒绝临时文件", { skip: !fs.existsSync(config.sampleExcelPath) || !fs.existsSync(config.sampleZipPath) }, async () => {
+test("108独立核验SFTP落盘哈希、CV_ID映射、ZIP CRC且拒绝临时文件", { skip: !fs.existsSync(config.sampleExcelPath) || !fs.existsSync(config.sampleZipPath) }, async () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "bayt-incoming-"));
   try {
     const batch = path.join(directory, "run-test", "batch-0001");

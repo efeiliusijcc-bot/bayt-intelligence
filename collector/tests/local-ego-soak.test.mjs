@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { POLICY, classifyFailure, freshNextPage, challengeDecision, deadlineReached } from '../scripts/local-ego-soak.mjs';
+import { POLICY, classifyFailure, freshNextPage, challengeDecision, deadlineReached, finishIfReady, resumePhase } from '../scripts/local-ego-soak.mjs';
 import { assertPageEvidence, remoteDecision } from '../scripts/local-ego-upload.mjs';
 
 test('local run is time-bounded but has no resume-count cap', () => {
@@ -64,4 +64,28 @@ test('identity, anti-bot, and data-integrity errors are not retried blindly', ()
     'FILTER_CHANGED', 'CROSS_PAGE_CV_ID_OVERLAP', 'XLS_CV_ID_MAPPING_FAILED', 'ZIP_CRC_FAILURE']) {
     assert.equal(classifyFailure(code), 'safety', code);
   }
+});
+
+test('complete immediately at page limit while preserving the original cross-job cooldown', () => {
+  const nextActionAt = new Date(Date.now() + 60 * 60_000).toISOString();
+  const state = { phase: 'next', status: 'running', limits: { maxPages: 1 }, pages: [{}], seenIds: ['1'],
+    deadlineAt: '2100-01-01T00:00:00Z', nextActionAt };
+  assert.equal(finishIfReady(state), true);
+  assert.equal(state.status, 'completed');
+  assert.equal(state.nextActionAt, null);
+  assert.equal(state.browserCooldownUntil, nextActionAt);
+});
+
+test('deadline does not restart collection or abandon the PDF paired with an existing XLS', () => {
+  const state = { phase: 'excel_prepare', pages: [], seenIds: [], deadlineAt: '2020-01-01T00:00:00Z' };
+  assert.equal(finishIfReady({ ...state, phase: 'pdf_prepare' }), false);
+  assert.equal(finishIfReady(state), true);
+  assert.equal(state.deadlineAt, '2020-01-01T00:00:00Z');
+});
+
+test('resume preserves the interrupted format and never repeats an uncertain download', () => {
+  const state = { phase: 'stopped', resumePhase: 'pdf_confirm', pages: [], current: { page: 1, excel: {} } };
+  assert.equal(resumePhase(state), 'pdf_prepare');
+  assert.equal(resumePhase({ phase: 'stopped', pages: [{ page: 1 }], current: { page: 1, pdf: {} } }), 'next');
+  assert.throws(() => resumePhase({ ...state, intent: { format: 'pdf' } }), /UNCERTAIN/);
 });
