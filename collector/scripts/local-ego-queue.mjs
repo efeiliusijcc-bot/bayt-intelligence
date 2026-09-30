@@ -304,9 +304,10 @@ async function startResume(job, leaseToken, runId) {
     const marker = await readJson(path.join(queueDir, 'awaiting-verification.json'));
     userVerified = marker.status === 'verified' && Date.parse(marker.verifiedAt) >= Date.parse(state.challenge?.notifiedAt || state.updatedAt);
   } catch (error) { if (error.code !== 'ENOENT') throw error; }
-  if (state.status === 'awaiting_verification' && !userVerified) throw Error('USER_VERIFICATION_REQUIRED');
+  if (state.status === 'awaiting_verification' && !userVerified && !job.rebuildRequest) throw Error('USER_VERIFICATION_REQUIRED');
   const active = { jobId: job.id, leaseToken, root, checkpointedPages: job.pages.map(page => page.page), userVerified,
     searchId: job.searchId, matchedCount: job.matchedCount, actualFilterLabels: job.actualFilterLabels,
+    rebuildRequest: job.rebuildRequest?.status === 'requested' ? job.rebuildRequest : null,
     recoveryPending: true, needsRebind: true };
   await atomicJson(activePath, active);
   return active;
@@ -415,6 +416,10 @@ async function startupPulse(active) {
     await request(`/jobs/${encodeURIComponent(active.jobId)}/pause-ack`, { agentId }, active.leaseToken);
     await fsp.unlink(activePath); return null;
   }
+  if (job.controlPaused) {
+    await request(`/jobs/${encodeURIComponent(active.jobId)}/pause-ack`, { agentId }, active.leaseToken);
+    await fsp.unlink(activePath); return null;
+  }
   if (job.limits.durationHours && Date.now() >= Date.parse(job.startedAt) + job.limits.durationHours * 3_600_000) {
     await terminal(active, 'JOB_HAS_NO_COMPLETE_PAGE', '持续时长已到，搜索阶段未产生完整页面'); return null;
   }
@@ -433,15 +438,77 @@ async function startupPulse(active) {
   }
 }
 
+export function assertRebuildCandidate(state, request, candidate) {
+  if (!request || state.intent || state.searchId !== request.oldSearchId || state.pages?.length !== 1 ||
+    state.current?.page !== 1 || !state.current.pdf || state.pages[0].page !== 1 ||
+    candidate.page !== 1 || !/^[A-Za-z0-9_-]{4,200}$/.test(candidate.searchId || '') || candidate.searchId === state.searchId ||
+    candidate.keyword !== state.keyword || !Array.isArray(candidate.ids) ||
+    candidate.ids.length !== state.seenIds.length || new Set(candidate.ids).size !== candidate.ids.length ||
+    candidate.ids.some(id => !state.seenIds.includes(id)) ||
+    state.current.ids.length !== candidate.ids.length || state.current.ids.some(id => !candidate.ids.includes(id)))
+    throw Error('SEARCH_REBUILD_FIRST_PAGE_MISMATCH');
+}
+
+async function applyRebuild(active) {
+  const candidate = active.rebuildCandidate, requestInfo = active.rebuildRequest;
+  const file = path.join(active.root, 'checkpoint.json');
+  const state = await readJson(file);
+  if (state.searchId === requestInfo.oldSearchId) assertRebuildCandidate(state, requestInfo, candidate);
+  else if (state.searchId !== candidate.searchId || state.searchHistory?.at(-1)?.requestId !== requestInfo.id)
+    throw Error('SEARCH_REBUILD_LOCAL_CONFLICT');
+  await runProcess(process.execPath, ['--experimental-strip-types', path.join(here, 'local-ego-soak.mjs'), 'verify-recovery', active.root]);
+  await request(`/jobs/${encodeURIComponent(active.jobId)}/search-rebuild`, { agentId, requestId: requestInfo.id,
+    runId: state.runId, oldSearchId: requestInfo.oldSearchId, newSearchId: candidate.searchId,
+    cvIdSetSha256: state.pages[0].cvIdSetSha256, selectedCount: candidate.ids.length,
+    noDownloadIntent: true, searchSpec: state.searchSpec }, active.leaseToken);
+  if (state.searchId !== candidate.searchId) {
+    const backup = path.join(active.root, `checkpoint-before-${requestInfo.id}.json`);
+    try { await fsp.copyFile(file, backup, fs.constants.COPYFILE_EXCL); }
+    catch (error) { if (error.code !== 'EEXIST') throw error; }
+    state.searchHistory = [...(state.searchHistory || []), { requestId: requestInfo.id, oldSearchId: state.searchId,
+      newSearchId: candidate.searchId, firstPageHash: state.pages[0].cvIdSetSha256, at: new Date().toISOString() }];
+    state.searchId = candidate.searchId; state.current.ids = candidate.ids;
+    await atomicJson(file, state);
+  }
+  active.searchId = candidate.searchId; active.rebuildRequest = null; active.rebuildCandidate = null;
+  active.recovery = null; active.userVerified = true;
+  await atomicJson(activePath, active);
+}
+
+async function rebuildSearch(active, state) {
+  if (!active.rebuildCandidate) {
+    await runProcess(process.execPath, ['--experimental-strip-types', path.join(here, 'local-ego-soak.mjs'), 'verify-resume', active.root, active.jobId]);
+    const candidate = await ego({ action: 'startSearch', searchSpec: state.searchSpec });
+    assertRebuildCandidate(state, active.rebuildRequest, candidate);
+    active.rebuildCandidate = candidate;
+    active.recovery = scheduleRecovery(null, 'verification', 'search_rebuild_commit', crypto.randomUUID());
+    await atomicJson(activePath, active);
+    await request(`/jobs/${encodeURIComponent(active.jobId)}/heartbeat`, { agentId,
+      evidence: { recovery: active.recovery, noDownloadIntent: true } }, active.leaseToken);
+  }
+  await applyRebuild(active);
+}
+
 async function activePulse(active) {
+  // Finish a committed binding before sending a heartbeat with an obsolete ID.
+  if (active.rebuildCandidate) await applyRebuild(active);
   let state = await readJson(path.join(active.root, 'checkpoint.json'));
   const job = await request(`/jobs/${encodeURIComponent(active.jobId)}/heartbeat`, {
     agentId, evidence: { searchId: active.searchId, matchedCount: active.matchedCount,
       actualFilterLabels: active.actualFilterLabels, phase: active.recovery || state.recovery ? 'automatic_recovery' : state.phase,
       recovery: active.recovery || state.recovery || null, noDownloadIntent: !state.intent,
       nextActionAt: active.recovery?.nextCheckAt || state.nextActionAt } }, active.leaseToken);
-  await atomicJson(path.join(active.root, 'control-lease.json'), { confirmedAt: new Date().toISOString() });
+  await atomicJson(path.join(active.root, 'control-lease.json'), { confirmedAt: new Date().toISOString(), controlPaused: !!job.controlPaused });
   if (job.pauseRequested) await atomicJson(path.join(active.root, 'stop-requested.json'), { at: new Date().toISOString(), reason: 'queue_pause' });
+  if (job.controlPaused) {
+    // No browser action or supervisor rebind while the control plane is paused.
+    // The worker observes controlPaused before its next action and exits safely.
+    if (state.status !== 'running') {
+      await request(`/jobs/${encodeURIComponent(active.jobId)}/pause-ack`, { agentId }, active.leaseToken);
+      await fsp.unlink(activePath); return false;
+    }
+    return true;
+  }
   if (state.status === 'safety_stopped' && automaticRecovery(state.recovery) &&
     ['LOCAL_LEASE_HEARTBEAT_LOST', 'QUEUE_SUPERVISOR_LOST'].includes(state.stopReason) && !state.intent) {
     await runProcess(process.execPath, ['--experimental-strip-types', path.join(here, 'local-ego-soak.mjs'), 'rebind-supervisor', active.root, String(process.pid)]);
@@ -460,6 +527,10 @@ async function activePulse(active) {
         if (outcome === 'manual') return false;
         if (outcome === 'waiting') return true;
       }
+      if (active.rebuildRequest) {
+        await rebuildSearch(active, state);
+        state = await readJson(path.join(active.root, 'checkpoint.json'));
+      }
       if (['safety_stopped', 'operator_stopped', 'awaiting_verification'].includes(state.status)) {
         await runProcess(process.execPath, ['--experimental-strip-types', path.join(here, 'local-ego-soak.mjs'), active.userVerified ? 'resume-verified' : 'recover', active.root]);
         state = await readJson(path.join(active.root, 'checkpoint.json'));
@@ -475,6 +546,9 @@ async function activePulse(active) {
       active.recoveryPending = false;
       await atomicJson(activePath, active);
     } catch (error) {
+      // Binding may already have committed on 108. Retry that idempotent
+      // binding, never abandon it or issue another search after a lost reply.
+      if (active.rebuildCandidate) throw error;
       if (await scheduleActiveRecovery(active, error)) return true;
       const failure = startSearchFailure(error);
       if (failure.code === 'BAYT_VERIFICATION_REQUIRED') await handOffStartChallenge(active.jobId, failure);
@@ -523,8 +597,9 @@ export async function withLeaseHeartbeat(owner, operation, send = request, inter
     if (busy) return;
     busy = true;
     try {
-      await send(`/jobs/${encodeURIComponent(owner.jobId)}/heartbeat`, { agentId }, owner.leaseToken);
-      if (owner.root && send === request) await atomicJson(path.join(owner.root, 'control-lease.json'), { confirmedAt: new Date().toISOString() });
+      const job = await send(`/jobs/${encodeURIComponent(owner.jobId)}/heartbeat`, { agentId }, owner.leaseToken);
+      if (owner.root && send === request) await atomicJson(path.join(owner.root, 'control-lease.json'),
+        { confirmedAt: new Date().toISOString(), controlPaused: !!job.controlPaused });
     }
     catch (error) { console.error(JSON.stringify({ event: 'lease_heartbeat_error', code: String(error.message).slice(0, 100) })); }
     finally { busy = false; }

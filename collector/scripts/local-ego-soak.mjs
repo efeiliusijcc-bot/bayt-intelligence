@@ -337,7 +337,7 @@ export function finishIfReady(state, now = Date.now()) {
   const expired = ['next', 'excel_prepare'].includes(state.phase) && deadlineReached(effectiveDeadline(state), now);
   if (limit || expired) {
     if (state.phase === 'next' && state.nextActionAt) state.browserCooldownUntil = state.nextActionAt;
-    state.status = 'completed'; state.phase = 'finished'; state.nextActionAt = null;
+    state.status = 'completed'; state.phase = 'finished'; state.nextActionAt = null; state.recovery = null;
     return true;
   }
   return false;
@@ -653,9 +653,14 @@ async function waitUntil(root, state) {
 
 async function checkControlLease(root, state) {
   if (state.schemaVersion !== 2) return true;
-  let confirmedAt;
-  try { confirmedAt = JSON.parse(await fsp.readFile(path.join(root, 'control-lease.json'), 'utf8')).confirmedAt; }
+  let confirmedAt, controlPaused;
+  try { ({ confirmedAt, controlPaused } = JSON.parse(await fsp.readFile(path.join(root, 'control-lease.json'), 'utf8'))); }
   catch { /* A missing control-plane acknowledgement is not a valid lease. */ }
+  if (controlPaused) {
+    state.resumePhase = state.phase; state.resumeNextActionAt = state.nextActionAt;
+    state.status = 'operator_stopped'; state.phase = 'stopped'; state.stopReason = 'GLOBAL_SAFETY_PAUSE';
+    await save(root, state); return false;
+  }
   if (confirmedAt && Date.now() - Date.parse(confirmedAt) < 90_000) return true;
   await stop(root, state, 'LOCAL_LEASE_HEARTBEAT_LOST'); return false;
 }

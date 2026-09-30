@@ -52,5 +52,5 @@ export function effectiveDeadline(state: { schemaVersion?: number; limits?: { du
 export function retryAfterTime(value: string | null, now = Date.now()): string | null {
   if (!value) return null;
   const at = /^\d+$/.test(value.trim()) ? now + Number(value.trim()) * 1000 : Date.parse(value);
-  return Number.isFinite(at) && at > now ? new Date(at).toISOString() : null;
+  return Number.isFinite(at) && at > now && at <= 8.64e15 ? new Date(at).toISOString() : null;
 }

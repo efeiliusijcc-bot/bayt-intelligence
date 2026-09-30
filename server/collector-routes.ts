@@ -93,7 +93,8 @@ export function createCollectorAgentRouter(store: CollectorControlStore, token: 
 
   router.post("/jobs/:id/heartbeat", (request, response, next) => {
     try {
-      response.json(store.heartbeatJob(request.params.id, bodyAgentId(request), leaseToken(request), request.body?.evidence || {}));
+      response.json({ ...store.heartbeatJob(request.params.id, bodyAgentId(request), leaseToken(request), request.body?.evidence || {}),
+        controlPaused: store.getControlState().globallyPaused });
     } catch (error) {
       next(error);
     }
@@ -102,6 +103,11 @@ export function createCollectorAgentRouter(store: CollectorControlStore, token: 
   router.post("/jobs/:id/recovery/claim", (request, response, next) => {
     try { response.json(store.reclaimRecovery(String(request.params.id), bodyAgentId(request), leaseToken(request),
       String(request.body?.newLeaseToken || ""), String(request.body?.recoveryId || ""))); }
+    catch (error) { next(error); }
+  });
+
+  router.post("/jobs/:id/search-rebuild", (request, response, next) => {
+    try { response.json(store.applySearchRebuild(String(request.params.id), bodyAgentId(request), leaseToken(request), request.body || {})); }
     catch (error) { next(error); }
   });
 
@@ -175,6 +181,13 @@ export function createCollectorControlRouter(
   const router = Router();
 
   router.get("/filter-catalog", (_request, response) => response.json(store.getCatalog()));
+  router.post("/jobs/:id/search-rebuild", requireBrowserMutation, (request, response, next) => {
+    try {
+      const job = store.requestSearchRebuild(String(request.params.id));
+      record(request, "COLLECTOR_SEARCH_REBUILD_REQUESTED", job.id);
+      response.json(job);
+    } catch (error) { next(error); }
+  });
   router.post("/verification", requireBrowserMutation, (request, response, next) => {
     try {
       const result = store.requestVerification(String(request.body?.agentId || ""), String(request.body?.verificationId || ""));

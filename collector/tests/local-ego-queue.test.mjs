@@ -3,7 +3,7 @@ import test from 'node:test';
 import fsp from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { assertNewSearchAllowed, assertResumeClaim, blockedByExistingRun, bootstrapRun, checkpointInput,
+import { assertNewSearchAllowed, assertResumeClaim, assertRebuildCandidate, blockedByExistingRun, bootstrapRun, checkpointInput,
   claimedActive, completeRunRegistration, startSearchFailure, terminalAcknowledged, verificationPending, withLeaseHeartbeat } from '../scripts/local-ego-queue.mjs';
 
 const manifest = { page: 1, selectedCount: 2, cvIdSetSha256: 'c'.repeat(64),
@@ -12,6 +12,20 @@ const manifest = { page: 1, selectedCount: 2, cvIdSetSha256: 'c'.repeat(64),
 const page = { page: 1, count: 2, cvIdSetSha256: manifest.cvIdSetSha256, manifest };
 const receipt = { status: 'uploaded', page: 1, manifestSha256: 'd'.repeat(64),
   excelSha256: 'a'.repeat(64), pdfSha256: 'b'.repeat(64), remoteBatch: '/opt/bayt-intelligence/data/incoming/local-ego-test/batch-0001' };
+
+test('search rebuild requires exactly the original complete first-page CV_ID set', () => {
+  const state = { searchId: 'search-old', keyword: 'Engineer', pages: [page], seenIds: ['1', '2'],
+    current: { page: 1, ids: ['1', '2'], pdf: {} }, intent: null };
+  const request = { id: 'rebuild-one', oldSearchId: state.searchId };
+  const candidate = { page: 1, keyword: state.keyword, ids: ['2', '1'], searchId: 'search-new' };
+  assert.doesNotThrow(() => assertRebuildCandidate(state, request, candidate));
+  for (const change of [{ ids: ['1', '3'] }, { ids: ['1', '1'] }, { page: 2 },
+    { keyword: 'Different' }, { searchId: 'search-old' }])
+    assert.throws(() => assertRebuildCandidate(state, request, { ...candidate, ...change }), /FIRST_PAGE_MISMATCH/);
+  for (const change of [{ intent: { format: 'xls' } }, { pages: [page, { ...page, page: 2 }] },
+    { current: { ...state.current, pdf: null } }])
+    assert.throws(() => assertRebuildCandidate({ ...state, ...change }, request, candidate), /FIRST_PAGE_MISMATCH/);
+});
 
 test('only a verified complete-page upload receipt becomes a 108 checkpoint', () => {
   assert.equal(checkpointInput(page, receipt).pdfEntries, 2);

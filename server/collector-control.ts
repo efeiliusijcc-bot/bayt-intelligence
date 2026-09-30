@@ -164,6 +164,7 @@ export interface CollectionJob {
   deliveryError: string | null;
   resumeMode: "new_search" | "checkpoint" | "review";
   recovery: BrowserRecovery | null;
+  rebuildRequest: { id: string; oldSearchId: string; newSearchId?: string; status: "requested" | "applied"; requestedAt: string } | null;
 }
 
 export interface AgentState {
@@ -544,7 +545,7 @@ export class CollectorControlStore {
     const jobColumns = this.db.prepare("PRAGMA table_info(collector_jobs)").all() as Array<{ name: string }>;
     if (!jobColumns.some((column) => column.name === "client_request_id")) this.db.exec("ALTER TABLE collector_jobs ADD COLUMN client_request_id TEXT");
     this.db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_collector_jobs_client_request ON collector_jobs(client_request_id) WHERE client_request_id IS NOT NULL");
-    for (const name of ["collection_finished_at", "collection_phase", "next_action_at", "delivery_error", "recovery_json"])
+    for (const name of ["collection_finished_at", "collection_phase", "next_action_at", "delivery_error", "recovery_json", "search_rebuild_json"])
       if (!jobColumns.some(column => column.name === name)) this.db.exec(`ALTER TABLE collector_jobs ADD COLUMN ${name} TEXT`);
     const runColumns = this.db.prepare("PRAGMA table_info(collector_job_runs)").all() as Array<{ name: string }>;
     for (const name of ["agent_id", "upload_token_hash", "finished_json"])
@@ -561,6 +562,9 @@ export class CollectorControlStore {
       requested_at TEXT NOT NULL, completed_at TEXT, detail TEXT);
       CREATE UNIQUE INDEX IF NOT EXISTS idx_verification_active ON collector_verification_requests(agent_id, verification_id)
         WHERE status IN ('pending','checking');`);
+    this.db.exec(`CREATE TABLE IF NOT EXISTS collector_search_rebuilds (
+      id TEXT PRIMARY KEY, job_id TEXT NOT NULL, run_id TEXT NOT NULL, old_search_id TEXT NOT NULL,
+      new_search_id TEXT NOT NULL, cv_id_set_sha256 TEXT NOT NULL, applied_at TEXT NOT NULL)`);
   }
 
   close(): void {
@@ -893,6 +897,7 @@ export class CollectorControlStore {
       nextActionAt: row.next_action_at ? String(row.next_action_at) : null,
       deliveryError: row.delivery_error ? String(row.delivery_error) : null,
       recovery: parseJson<BrowserRecovery | null>(row.recovery_json, null),
+      rebuildRequest: parseJson<CollectionJob["rebuildRequest"]>(row.search_rebuild_json, null),
       resumeMode: !row.search_id ? "new_search" : runs.count === 1 &&
         (row.status === "paused" || checkpointResumeCodes.has(String(row.error_code || ""))) ? "checkpoint" : "review",
     };
@@ -999,6 +1004,47 @@ export class CollectorControlStore {
       this.db.exec("ROLLBACK");
       throw error;
     }
+    return this.getJob(id)!;
+  }
+
+  requestSearchRebuild(id: string): CollectionJob {
+    const job = this.getJob(id);
+    if (!job?.searchId || !["paused", "safety_stopped"].includes(job.status) || job.completedPages !== 1 ||
+      job.collectedPages !== 1 || job.pages[0]?.page !== 1 || job.resumeMode !== "checkpoint")
+      throw new CollectorControlError("只允许重建已核验第一页且已停止的检查点任务", "REBUILD_REQUIRES_SINGLE_VERIFIED_PAGE", 409);
+    if (job.rebuildRequest?.status === "requested") return job;
+    const request = { id: randomId("rebuild"), oldSearchId: job.searchId, status: "requested", requestedAt: nowIso() };
+    this.db.prepare("UPDATE collector_jobs SET search_rebuild_json = ? WHERE id = ?").run(JSON.stringify(request), id);
+    return this.getJob(id)!;
+  }
+
+  applySearchRebuild(id: string, agentId: string, lease: string, input: Record<string, unknown>): CollectionJob {
+    const job = this.verifyLease(id, agentId, lease);
+    const request = job.rebuildRequest;
+    const run = this.db.prepare("SELECT job_id, search_id FROM collector_job_runs WHERE run_id = ?").get(String(input.runId || "")) as { job_id: string; search_id: string } | undefined;
+    if (!request || input.requestId !== request.id || input.oldSearchId !== request.oldSearchId ||
+      !/^[A-Za-z0-9_-]{4,200}$/.test(String(input.newSearchId || "")) || input.newSearchId === input.oldSearchId ||
+      !run || run.job_id !== id || job.completedPages !== 1 || job.collectedPages !== 1 ||
+      job.pages[0]?.cvIdSetSha256 !== input.cvIdSetSha256 || job.pages[0]?.selectedCount !== input.selectedCount ||
+      input.noDownloadIntent !== true || JSON.stringify(input.searchSpec) !== JSON.stringify(job.searchSpec) ||
+      this.getControlState().globallyPaused || job.pauseRequested)
+      throw new CollectorControlError("重建搜索与原条件、第一页或运行证据不一致", "SEARCH_REBUILD_EVIDENCE_INVALID", 409);
+    if (request.status === "applied") {
+      if (request.newSearchId !== input.newSearchId || job.searchId !== input.newSearchId || run.search_id !== input.newSearchId)
+        throw new CollectorControlError("重建回执冲突", "SEARCH_REBUILD_CONFLICT", 409);
+      return job;
+    }
+    if (job.searchId !== request.oldSearchId || run.search_id !== request.oldSearchId)
+      throw new CollectorControlError("原搜索登记发生变化", "SEARCH_REBUILD_CONFLICT", 409);
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.db.prepare("INSERT INTO collector_search_rebuilds VALUES (?,?,?,?,?,?,?)").run(request.id, id,
+        String(input.runId), request.oldSearchId, String(input.newSearchId), String(input.cvIdSetSha256), nowIso());
+      this.db.prepare("UPDATE collector_jobs SET search_id = ?, search_rebuild_json = ? WHERE id = ?")
+        .run(String(input.newSearchId), JSON.stringify({ ...request, status: "applied", newSearchId: input.newSearchId }), id);
+      this.db.prepare("UPDATE collector_job_runs SET search_id = ? WHERE run_id = ?").run(String(input.newSearchId), String(input.runId));
+      this.db.exec("COMMIT");
+    } catch (error) { this.db.exec("ROLLBACK"); throw error; }
     return this.getJob(id)!;
   }
 
@@ -1305,14 +1351,14 @@ export class CollectorControlStore {
 
   heartbeatJob(jobId: string, agentId: string, leaseToken: string, evidence: Record<string, unknown> = {}, leaseMs = 120_000): CollectionJob {
     const job = this.verifyLease(jobId, agentId, leaseToken);
+    if (job.searchId && evidence.searchId && evidence.searchId !== job.searchId)
+      throw new CollectorControlError("搜索标识变化", "RUN_JOB_LINK_INVALID", 409);
     if (evidence.recovery !== undefined) {
       if (evidence.recovery !== null && (!validRecovery(evidence.recovery) || evidence.noDownloadIntent !== true))
         throw new CollectorControlError("恢复检查点不完整或存在下载意图", "RECOVERY_EVIDENCE_INVALID", 409);
       this.db.prepare("UPDATE collector_jobs SET recovery_json = ? WHERE id = ?")
         .run(evidence.recovery ? JSON.stringify(evidence.recovery) : null, jobId);
     }
-    if (job.searchId && evidence.searchId && evidence.searchId !== job.searchId)
-      throw new CollectorControlError("搜索标识变化", "RUN_JOB_LINK_INVALID", 409);
     this.db.prepare(`UPDATE collector_jobs SET lease_expires_at = ?, search_id = COALESCE(?, search_id),
       matched_count = COALESCE(?, matched_count), actual_filter_labels_json = CASE WHEN ? IS NULL THEN actual_filter_labels_json ELSE ? END
       WHERE id = ?`).run(

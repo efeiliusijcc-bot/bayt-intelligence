@@ -44,8 +44,13 @@ function checkboxRef(snapshot) {
 async function observe() { return await page.evaluate(recoveryPageState); }
 async function boundedWait() {
   try { await page.waitForFunction(() => /请稍候|just a moment|security verification/i.test(document.title) ||
-    !!document.querySelector('input[type=password]') || performance.getEntriesByType('resource').some(e =>
-      e.responseStatus > 0 && /\/v6\/(?:cvSearch|employer\/myAccount\/employerPreferences)/.test(new URL(e.name).pathname)),
+    !!document.querySelector('input[type=password]') || performance.getEntriesByType('resource').some(e => {
+      const u = new URL(e.name, location.href);
+      const critical = /^\/v6\/cvSearch\/[^/]+\/results\/?$/.test(u.pathname) ||
+        /^\/v6\/cvSearch\/recentSearches\/?$/.test(u.pathname) || u.pathname === '/v6/employer/myAccount/employerPreferences';
+      return u.origin === location.origin && critical && ([401,403,429].includes(e.responseStatus) ||
+        (e.responseStatus === 200 && /employerPreferences|\/results\/?$/.test(u.pathname) && !!document.querySelector('#searchBar')));
+    }),
     undefined, { timeout: 20_000 }); } catch {}
 }
 let state = await observe();

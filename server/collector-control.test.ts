@@ -27,6 +27,10 @@ test("限流等待租约过期可凭原凭据恢复；不释放给其他任务�
     const nextToken = crypto.randomBytes(32).toString("base64url");
     assert.throws(() => store.reclaimRecovery(first.id, "local-ego-other", claim.leaseToken!, nextToken, recovery.id), /身份/);
     assert.throws(() => store.reclaimRecovery(first.id, "local-ego-test", "wrong", nextToken, recovery.id), /身份/);
+    store.db.prepare("UPDATE collector_control_state SET globally_paused = 1 WHERE singleton = 1").run();
+    assert.throws(() => store.reclaimRecovery(first.id, "local-ego-test", claim.leaseToken!, nextToken, recovery.id));
+    assert.equal(store.getControlState().globallyPaused, true);
+    store.db.prepare("UPDATE collector_control_state SET globally_paused = 0 WHERE singleton = 1").run();
     store.reclaimRecovery(first.id, "local-ego-test", claim.leaseToken!, nextToken, recovery.id);
     store.reclaimRecovery(first.id, "local-ego-test", claim.leaseToken!, nextToken, recovery.id); // Lost response is idempotent.
     assert.equal(store.getJob(first.id)?.recovery?.nextCheckAt, recovery.nextCheckAt);
@@ -120,6 +124,45 @@ function cleanup(store: CollectorControlStore, directory: string): void {
 const localEvidence = (page = 1) => ({ page, selectedCount: 2, cvIdSetSha256: "c".repeat(64),
   excelSha256: "a".repeat(64), excelSizeBytes: 100, pdfSha256: "b".repeat(64), pdfSizeBytes: 200,
   pdfEntries: 2, zipCrcOk: true });
+
+test("同条件重建搜索保留原页、运行和起始时间；提交后崩溃可幂等恢复", () => {
+  const { store, directory, version } = fixtureStore();
+  try {
+    const job = store.createJob({ searchSpec: spec(version), limits: { targetCount: 150 } });
+    const agent = "local-ego-test", runId = "local-ego-rebuild-test";
+    const claim = store.claimJob(agent), lease = claim.leaseToken!;
+    store.registerRun(job.id, agent, lease, runId, "search-old");
+    const page = { ...localEvidence(), remoteBatch: `/incoming/${runId}/batch-0001` };
+    store.checkpointPage(job.id, agent, lease, page);
+    store.reportLocalPages(job.id, agent, lease, { runId, pages: [localEvidence()] });
+    store.safetyStop(job.id, agent, lease, { code: "CHECKPOINT_RESUME_BLOCKED", message: "旧搜索无法翻页" });
+    const requested = store.requestSearchRebuild(job.id);
+    assert.equal(store.requestSearchRebuild(job.id).rebuildRequest?.id, requested.rebuildRequest?.id);
+    store.resumeJob(job.id);
+    const resumed = store.claimJob(agent), newLease = resumed.leaseToken!;
+    const proof = { requestId: requested.rebuildRequest!.id, runId, oldSearchId: "search-old", newSearchId: "search-new",
+      cvIdSetSha256: page.cvIdSetSha256, selectedCount: 2, noDownloadIntent: true, searchSpec: job.searchSpec };
+    for (const change of [{ cvIdSetSha256: "d".repeat(64) }, { runId: "local-ego-other" },
+      { searchSpec: spec(version, "Other") }, { noDownloadIntent: false }, { newSearchId: "search-old" }])
+      assert.throws(() => store.applySearchRebuild(job.id, agent, newLease, { ...proof, ...change }), /不一致/);
+    store.db.prepare("UPDATE collector_control_state SET globally_paused = 1 WHERE singleton = 1").run();
+    assert.throws(() => store.applySearchRebuild(job.id, agent, newLease, proof), /不一致/);
+    assert.equal(store.getJob(job.id)?.searchId, "search-old");
+    store.db.prepare("UPDATE collector_control_state SET globally_paused = 0 WHERE singleton = 1").run();
+    store.applySearchRebuild(job.id, agent, newLease, proof);
+    const result = store.applySearchRebuild(job.id, agent, newLease, proof);
+    assert.equal(result.searchId, "search-new");
+    assert.equal(result.startedAt, claim.job!.startedAt);
+    assert.deepEqual(result.limits, job.limits);
+    assert.equal(result.completedPages, 1); assert.equal(result.collectedPages, 1);
+    assert.equal(result.exportedCount, 2);
+    assert.equal(store.jobForRun(runId), job.id);
+    assert.equal(store.db.prepare("SELECT COUNT(*) n FROM collector_search_rebuilds").get()!.n, 1);
+    assert.throws(() => store.applySearchRebuild(job.id, agent, newLease, { ...proof, newSearchId: "search-third" }), /冲突/);
+    // An independent uploader can still acknowledge the original immutable page.
+    assert.equal(store.checkpointPage(job.id, agent, newLease, page).completedPages, 1);
+  } finally { cleanup(store, directory); }
+});
 
 test("HTTP上传在采集租约释放后继续，108实际复核文件且重复回执幂等", { skip: !fs.existsSync(config.sampleExcelPath) || !fs.existsSync(config.sampleZipPath) }, async () => {
   const { store, directory, version } = fixtureStore();

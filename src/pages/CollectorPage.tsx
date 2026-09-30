@@ -128,7 +128,7 @@ export function CollectorPage() {
   return <div className="page-stack collector-page">
     <div className="page-heading action-heading">
       <div><h1>采集任务</h1><p>108 管理搜索条件与串行队列；本机 Ego 执行官网搜索和整页导出，108 持续接收并展示。</p></div>
-      <Badge appearance="outline" color={queueQuery.data?.control.globallyPaused || verificationRequired ? "danger" : queueReady ? "success" : "warning"}>{queueQuery.data?.control.globallyPaused ? "全队列安全暂停" : verificationRequired ? "等待 Bayt 人工验证" : queueReady ? "串行队列可执行" : "Agent 未就绪，任务暂不领取"}</Badge>
+      <Badge appearance="outline" color={queueQuery.data?.control.globallyPaused || verificationRequired ? "danger" : queueReady ? "success" : "warning"}>{queueQuery.data?.control.globallyPaused ? "全队列安全暂停" : verificationRequired ? "等待 Bayt 人工验证" : localAgent?.waitReason === "automatic_recovery" ? "官网恢复等待中" : queueReady ? "串行队列可执行" : "Agent 未就绪，任务暂不领取"}</Badge>
     </div>
 
     <section className="collector-security-strip">

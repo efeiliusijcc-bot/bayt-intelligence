@@ -26,12 +26,15 @@ test('server wait, existing pacing, and incident identity survive challenge tran
   assert.equal(Date.parse(again.nextCheckAt), now + 10 * 60_000);
   assert.equal(retryAfterTime('1800', now), new Date(now + 1800_000).toISOString());
   assert.equal(retryAfterTime('bad', now), null);
+  assert.equal(retryAfterTime('99999999999999999999', now), null);
   assert.equal(recoveryKind('UNCERTAIN_DOWNLOAD_RESULT'), null);
 });
 test('count jobs have no 48-hour cutoff while explicit duration retains its deadline', () => {
   const state = { schemaVersion: 2, limits: { targetCount: 150 }, phase: 'excel_prepare', deadlineAt: '2020-01-01T00:00:00Z', pages: [], seenIds: [] };
   assert.equal(effectiveDeadline(state), null); assert.equal(finishIfReady(state), false);
-  assert.equal(finishIfReady({ ...state, limits: { durationHours: 24 } }), true);
+  const timed = { ...state, limits: { durationHours: 24 }, recovery: { id: 'old-wait' } };
+  assert.equal(finishIfReady(timed), true);
+  assert.equal(timed.recovery, null);
 });
 
 const script = await fs.readFile(new URL('../scripts/local-ego-recovery-action.mjs', import.meta.url), 'utf8');
