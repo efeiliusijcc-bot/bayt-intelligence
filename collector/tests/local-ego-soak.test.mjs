@@ -56,7 +56,8 @@ test('temporary navigation and rate errors receive cooldowns', () => {
   assert.equal(classifyFailure('Page timed out after 3000ms'), 'transient');
   assert.equal(classifyFailure('BAYT_LISTING_NOT_VISIBLE'), 'transient');
   assert.equal(classifyFailure('BAYT_RATE_LIMIT'), 'rate_limit');
-  assert.deepEqual(POLICY.rateWaitsMs, [20, 10].map(minutes => minutes * 60_000));
+  assert.equal(POLICY.rateWaitMinMs, 15 * 60_000);
+  assert.equal(POLICY.rateWaitMaxMs, 60 * 60_000);
 });
 
 test('identity, anti-bot, and data-integrity errors are not retried blindly', () => {

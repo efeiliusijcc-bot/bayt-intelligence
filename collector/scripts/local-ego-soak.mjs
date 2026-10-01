@@ -22,7 +22,8 @@ export const POLICY = Object.freeze({
   pageMinMs: 60 * 60_000,
   pageMaxMs: 70 * 60_000,
   transientWaitsMs: [2 * 60_000, 5 * 60_000, 15 * 60_000],
-  rateWaitsMs: [20 * 60_000, 10 * 60_000],
+  rateWaitMinMs: 15 * 60_000,
+  rateWaitMaxMs: 60 * 60_000,
 });
 export const jitter = (min, max) => crypto.randomInt(min, max + 1);
 export const deadlineReached = (deadlineAt, now = Date.now()) => !!deadlineAt && now >= Date.parse(deadlineAt);
@@ -432,13 +433,16 @@ async function handleError(root, state, error) {
   }
   const kind = classifyFailure(message);
   const attempts = kind === 'rate_limit' ? ++state.rateLimits : ++state.failures;
-  const schedule = kind === 'rate_limit' ? POLICY.rateWaitsMs : POLICY.transientWaitsMs;
-  if (kind === 'safety' || attempts > schedule.length) {
+  const exhausted = kind === 'rate_limit' ? false : attempts > POLICY.transientWaitsMs.length;
+  if (kind === 'safety' || exhausted) {
     const safeCode = message.match(/\b[A-Z][A-Z0-9_]{3,}\b/)?.[0] || 'SAFETY_CHECK_FAILED';
     await stop(root, state, kind === 'safety' ? safeCode : `${kind.toUpperCase()}_RETRY_EXHAUSTED`);
     return;
   }
-  state.nextActionAt = new Date(Date.now() + schedule[attempts - 1]).toISOString();
+  const wait = kind === 'rate_limit'
+    ? crypto.randomInt(POLICY.rateWaitMinMs, POLICY.rateWaitMaxMs + 1)
+    : POLICY.transientWaitsMs[attempts - 1];
+  state.nextActionAt = new Date(Date.now() + wait).toISOString();
   await save(root, state);
   await appendLog(root, 'retry_scheduled', { kind, attempt: attempts, phase: state.phase, nextActionAt: state.nextActionAt });
 }

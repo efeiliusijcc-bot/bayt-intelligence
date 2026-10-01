@@ -7,12 +7,14 @@ import test from 'node:test';
 import { scheduleRecovery, effectiveDeadline, retryAfterTime, recoveryKind } from '../src/recovery.ts';
 import { finishIfReady, finishExpiredRecovery } from '../scripts/local-ego-soak.mjs';
 
-test('20 minutes initially, then unlimited 10 minute waits survive serialization', () => {
-  let now = Date.parse('2026-09-30T00:00:00Z'), r = null;
+test('rate-limit waits stay within 15-60 minutes and survive serialization', () => {
+  const now = Date.parse('2026-09-30T00:00:00Z');
+  let r = null;
   for (let index = 0; index < 100; index++) {
     r = scheduleRecovery(JSON.parse(JSON.stringify(r)), 'rate_limit', 'next', 'episode-test', now);
-    assert.equal(Date.parse(r.nextCheckAt) - now, (index ? 10 : 20) * 60_000);
-    assert.equal(r.rateLimits, index + 1); now = Date.parse(r.nextCheckAt);
+    const wait = Date.parse(r.nextCheckAt) - now;
+    assert.ok(wait >= 15 * 60_000 && wait <= 60 * 60_000, `wait ${wait} out of range`);
+    assert.equal(r.rateLimits, index + 1);
   }
   assert.equal(r.startedAt, '2026-09-30T00:00:00.000Z');
 });
@@ -22,8 +24,10 @@ test('server wait, existing pacing, and incident identity survive challenge tran
   assert.equal(r.nextCheckAt, serverWait);
   const challenge = scheduleRecovery(r, 'verification', 'other', 'another-id', now);
   assert.equal(challenge.id, r.id); assert.equal(challenge.notBefore, serverWait);
-  const again = scheduleRecovery(challenge, 'rate_limit', 'other', 'another-id', now);
-  assert.equal(Date.parse(again.nextCheckAt), now + 10 * 60_000);
+  const again = scheduleRecovery(challenge, 'rate_limit', 'other', 'another-id', now, null, null, () => 0);
+  assert.equal(Date.parse(again.nextCheckAt), now + 15 * 60_000);
+  const capped = scheduleRecovery(challenge, 'rate_limit', 'other', 'another-id', now, null, null, () => 0.999999);
+  assert.ok(Date.parse(capped.nextCheckAt) - now <= 60 * 60_000);
   assert.equal(retryAfterTime('1800', now), new Date(now + 1800_000).toISOString());
   assert.equal(retryAfterTime('bad', now), null);
   assert.equal(retryAfterTime('99999999999999999999', now), null);

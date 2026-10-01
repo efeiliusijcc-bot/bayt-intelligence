@@ -1,4 +1,5 @@
-// Shared, deterministic recovery policy. Never performs a browser action.
+// Shared recovery policy. Never performs a browser action. Rate-limit waits
+// are randomized (15-60 min); all other scheduling stays deterministic.
 export interface BrowserRecovery {
   id: string;
   kind: "rate_limit" | "verification";
@@ -11,8 +12,14 @@ export interface BrowserRecovery {
   notBefore: string | null;
   lastCode: string;
 }
-export const RECOVERY_FIRST_MS = 20 * 60_000;
-export const RECOVERY_NEXT_MS = 10 * 60_000;
+// Rate-limit waits are randomized between 15 and 60 minutes so repeated runs
+// do not form a predictable, low-entropy cadence that Bayt can fingerprint.
+export const RECOVERY_MIN_MS = 15 * 60_000;
+export const RECOVERY_MAX_MS = 60 * 60_000;
+
+/** Default random source; injectable in tests to keep assertions deterministic. */
+export type RecoveryRandom = () => number;
+const defaultRandom: RecoveryRandom = () => Math.random();
 
 export function recoveryKind(message: string): BrowserRecovery["kind"] | null {
   if (/BAYT_RATE_LIMIT|BAYT_429|HTTP_429/.test(message)) return "rate_limit";
@@ -21,9 +28,12 @@ export function recoveryKind(message: string): BrowserRecovery["kind"] | null {
 }
 
 export function scheduleRecovery(previous: BrowserRecovery | null | undefined, kind: BrowserRecovery["kind"],
-  phase: string, id: string, now = Date.now(), retryAfterAt: string | null = null, notBefore: string | null = null): BrowserRecovery {
+  phase: string, id: string, now = Date.now(), retryAfterAt: string | null = null, notBefore: string | null = null,
+  random: RecoveryRandom = defaultRandom): BrowserRecovery {
   const rateLimits = (previous?.rateLimits || 0) + (kind === "rate_limit" ? 1 : 0);
-  const wait = kind === "rate_limit" ? rateLimits === 1 ? RECOVERY_FIRST_MS : RECOVERY_NEXT_MS : 0;
+  const wait = kind === "rate_limit"
+    ? RECOVERY_MIN_MS + Math.floor(random() * (RECOVERY_MAX_MS - RECOVERY_MIN_MS + 1))
+    : 0;
   const retryAfter = retryAfterAt && Number.isFinite(Date.parse(retryAfterAt)) ? Date.parse(retryAfterAt) : 0;
   return { id: previous?.id || id, kind, stage: "waiting", startedAt: previous?.startedAt || new Date(now).toISOString(),
     nextCheckAt: new Date(Math.max(now + wait, retryAfter)).toISOString(), attempts: previous?.attempts || 0,

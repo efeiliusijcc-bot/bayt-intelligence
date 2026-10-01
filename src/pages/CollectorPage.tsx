@@ -164,7 +164,7 @@ export function CollectorPage() {
 
     <section className="section-panel">
       <div className="section-heading collector-template-heading"><div><h2>搜索模板库与采集范围</h2><p>发布时生成不可变条件快照；匹配人数由执行中的本机 Agent 回报，不在发布前请求官网。</p></div><LimitsEditor targetCount={targetCount} maxPages={maxPages} durationHours={durationHours} setTargetCount={setTargetCount} setMaxPages={setMaxPages} setDurationHours={setDurationHours} /></div>
-      <div className="collector-soft-limit">人数/页数任务保留每日500人上限，不设内部48小时截止；429首次等待20分钟，之后每10分钟自动检查。普通验证框自动尝试一次；登录或数据校验异常需要处理。持续时长任务按整页完成，保留原截止时间。</div>
+      <div className="collector-soft-limit">人数/页数任务保留每日500人上限，不设内部48小时截止；429限流随机等待15-60分钟后自动检查。普通验证框自动尝试一次；登录或数据校验异常需要处理。持续时长任务按整页完成，保留原截止时间。</div>
       {templatesQuery.isPending ? <ProgressBar /> : templatesQuery.isError ? <div className="inline-error">{templatesQuery.error.message}</div> : templatesQuery.data?.items.length ? <div className="collector-template-list">{templatesQuery.data.items.map((template) =>
         <TemplateCard key={template.id} template={template} catalog={catalog} disabled={!limits || mutation.isPending || !catalogReady}
           onEdit={() => editTemplate(template)} onCopy={() => mutation.mutate(() => apiClient.copyCollectorSearchTemplate(template.id))}
